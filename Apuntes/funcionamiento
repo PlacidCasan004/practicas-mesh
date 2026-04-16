@@ -38,12 +38,26 @@ PROBAR EL RELEE PARA VER SI SE ABRE Y CIERRA
 
 Lo que pasa es que tienes dos lógicas mandando sobre el mismo relé:
 
-la lógica manual por comando MQTT:
-RELAY_ON
-RELAY_OFF
-la lógica automática de sensor_relay_task():
-si temperatura >= 28 → relé ON
-si temperatura < 28 → relé OFF
+---la lógica manual por comando MQTT:
+-RELAY_ON
+-RELAY_OFF
+---la lógica automática de sensor_relay_task():
+-si temperatura >= 28 → relé ON
+-si temperatura < 28 → relé OFF
+
+
+
+
+
+PORQUE SOLO SE VE UN NODO DE MOMENTO EN LA BASE DE DATOS
+
+---Cada nodo sensor publica periódicamente un JSON con varias magnitudes. En Node-RED, ese mensaje se descompone en varias inserciones independientes en MariaDB, una por cada magnitud (temperature, pressure_hpa, humidity, relay, layer). Por eso varias filas consecutivas corresponden a una única lectura. Si solo un nodo sensor está activo, todas las filas aparecen asociadas a la misma MAC.
+
+
+
+
+
+
 
 
 

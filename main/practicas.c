@@ -24,7 +24,7 @@
 #include "bme280.h"
 
 #define RX_SIZE              1500
-#define TX_INTERVAL_MS       5000
+#define TX_INTERVAL_MS       30000
 #define SENSOR_INTERVAL_MS   2000
 #define MESH_MAX_LAYER       3
 
