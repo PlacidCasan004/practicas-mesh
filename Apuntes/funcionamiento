@@ -17,7 +17,12 @@ ese nodo activa el relé.
 
 
 
-
+COMO ENTRAR EN LA BASE DE DATOS
+1--docker exec -it mariadb mariadb -u root -p
+CONTRASEÑA:
+2--root123
+3--USE sensores;
+4--SELECT * FROM mediciones ORDER BY id DESC;
 
 
 

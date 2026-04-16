@@ -76,6 +76,10 @@ static QueueHandle_t mqtt_queue = NULL;
 static SemaphoreHandle_t sensor_mutex = NULL;
 static SemaphoreHandle_t relay_mutex = NULL;
 
+
+static void publish_root_sensor_snapshot(void);
+
+
 static const char *TAG = "MESH_TEST";
 static const uint8_t MESH_ID[6] = {0x7C, 0xDF, 0xA1, 0x00, 0x00, 0x01};
 
@@ -712,6 +716,67 @@ static void rx_task(void *arg)
     }
 }
 
+
+
+
+static void publish_root_sensor_snapshot(void)
+{
+    if (!esp_mesh_is_root()) {
+        return;
+    }
+
+    if (mqtt_client == NULL || !mqtt_connected) {
+        ESP_LOGW(TAG, "Root con sensor, pero MQTT no conectado");
+        return;
+    }
+
+    char mac_str[32];
+    uint8_t mac[6];
+    char msg[MQTT_MSG_MAX_LEN];
+    char topic[MQTT_TOPIC_MAX_LEN];
+
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    format_mac_no_colons(mac, mac_str, sizeof(mac_str));
+
+    if (sensor_mutex != NULL &&
+        xSemaphoreTake(sensor_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+
+        snprintf(msg, sizeof(msg), "%s", g_sensor_data.payload);
+        xSemaphoreGive(sensor_mutex);
+    } else {
+        ESP_LOGW(TAG, "No se pudo tomar sensor_mutex para publicar desde root");
+        return;
+    }
+
+    if (strlen(msg) == 0) {
+        ESP_LOGW(TAG, "Snapshot vacío en root");
+        return;
+    }
+
+    snprintf(topic, sizeof(topic), "%s/%s", MQTT_DATA_BASE_TOPIC, mac_str);
+
+    int msg_id = esp_mqtt_client_publish(
+        mqtt_client,
+        topic,
+        msg,
+        0,
+        1,
+        0
+    );
+
+    if (msg_id >= 0) {
+        ESP_LOGI(TAG, "Root publicó su propio sensor en MQTT topic %s, msg_id=%d, msg=%s",
+                 topic, msg_id, msg);
+    } else {
+        ESP_LOGW(TAG, "Root no pudo publicar su propio sensor en MQTT");
+    }
+}
+
+
+
+
+
+
 /*
  * tx_task:
  * Envía mensajes por la mesh.
@@ -732,7 +797,7 @@ static void tx_task(void *arg)
     data.tos = MESH_TOS_P2P;
 
     while (1) {
-        if (is_mesh_connected && !esp_mesh_is_root() && sensor_ready) {
+        if (is_mesh_connected && sensor_ready) {
             bool has_data = false;
 
             if (sensor_mutex != NULL &&
@@ -743,13 +808,17 @@ static void tx_task(void *arg)
             }
 
             if (has_data) {
-                data.size = strlen(msg) + 1;
+                if (!esp_mesh_is_root()) {
+                    data.size = strlen(msg) + 1;
 
-                esp_err_t err = esp_mesh_send(NULL, &data, 0, NULL, 0);
-                if (err == ESP_OK) {
-                    ESP_LOGI(TAG, "TX sensor hacia arriba: %s", msg);
+                    esp_err_t err = esp_mesh_send(NULL, &data, 0, NULL, 0);
+                    if (err == ESP_OK) {
+                        ESP_LOGI(TAG, "TX sensor hacia arriba: %s", msg);
+                    } else {
+                        ESP_LOGW(TAG, "Error TX: %s", esp_err_to_name(err));
+                    }
                 } else {
-                    ESP_LOGW(TAG, "Error TX: %s", esp_err_to_name(err));
+                    publish_root_sensor_snapshot();
                 }
             }
         }
@@ -757,6 +826,8 @@ static void tx_task(void *arg)
         vTaskDelay(pdMS_TO_TICKS(TX_INTERVAL_MS));
     }
 }
+
+
 
 /*
  * mqtt_task:
