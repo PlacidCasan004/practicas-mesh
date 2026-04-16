@@ -1,0 +1,148 @@
+[
+    {
+        "id": "7fb507cca68e61c2",
+        "type": "tab",
+        "label": "Flow 1",
+        "disabled": false,
+        "info": "",
+        "env": []
+    },
+    {
+        "id": "cf75a0e530b20b46",
+        "type": "mqtt-broker",
+        "name": "",
+        "broker": "mqtt",
+        "port": 1883,
+        "clientid": "",
+        "autoConnect": true,
+        "usetls": false,
+        "protocolVersion": 4,
+        "keepalive": 60,
+        "cleansession": true,
+        "autoUnsubscribe": true,
+        "birthTopic": "",
+        "birthQos": "0",
+        "birthRetain": "false",
+        "birthPayload": "",
+        "birthMsg": {},
+        "closeTopic": "",
+        "closeQos": "0",
+        "closeRetain": "false",
+        "closePayload": "",
+        "closeMsg": {},
+        "willTopic": "",
+        "willQos": "0",
+        "willRetain": "false",
+        "willPayload": "",
+        "willMsg": {},
+        "userProps": "",
+        "sessionExpiry": ""
+    },
+    {
+        "id": "c81a228720994e11",
+        "type": "MySQLdatabase",
+        "name": "database",
+        "host": "mariadb",
+        "port": "3306",
+        "db": "",
+        "tz": "",
+        "charset": "UTF8"
+    },
+    {
+        "id": "5e3077a49e0c273e",
+        "type": "MySQLdatabase",
+        "name": "",
+        "host": "mariadb",
+        "port": "3306",
+        "db": "sensores",
+        "tz": "",
+        "charset": "UTF8"
+    },
+    {
+        "id": "9130444dd322565b",
+        "type": "mqtt in",
+        "z": "7fb507cca68e61c2",
+        "name": "",
+        "topic": "mesh/data/#",
+        "qos": "2",
+        "datatype": "auto-detect",
+        "broker": "cf75a0e530b20b46",
+        "nl": false,
+        "rap": true,
+        "rh": 0,
+        "inputs": 0,
+        "x": 130,
+        "y": 180,
+        "wires": [
+            [
+                "5dcb27a08451c215"
+            ]
+        ]
+    },
+    {
+        "id": "5dcb27a08451c215",
+        "type": "json",
+        "z": "7fb507cca68e61c2",
+        "name": "",
+        "property": "payload",
+        "action": "obj",
+        "pretty": false,
+        "x": 350,
+        "y": 180,
+        "wires": [
+            [
+                "d5986f9c34769328"
+            ]
+        ]
+    },
+    {
+        "id": "d5986f9c34769328",
+        "type": "function",
+        "z": "7fb507cca68e61c2",
+        "name": "function 1",
+        "func": "let partes = msg.topic.split(\"/\");\nlet nodo = partes[partes.length - 1];\n\nlet d = msg.payload;\n\nmsg.topic = `\nINSERT INTO mediciones_completas\n(nodo, temperature, pressure_hpa, humidity, relay, mode, layer)\nVALUES (?, ?, ?, ?, ?, ?, ?)\n`;\n\nmsg.payload = [\n    nodo,\n    d.temperature ?? null,\n    d.pressure_hpa ?? null,\n    d.humidity ?? null,\n    d.relay ?? null,\n    d.mode ?? null,\n    d.layer ?? null\n];\n\nreturn msg;",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 160,
+        "y": 340,
+        "wires": [
+            [
+                "7bd0487d6bc22bb3"
+            ]
+        ]
+    },
+    {
+        "id": "7bd0487d6bc22bb3",
+        "type": "mysql",
+        "z": "7fb507cca68e61c2",
+        "mydb": "5e3077a49e0c273e",
+        "name": "",
+        "x": 400,
+        "y": 340,
+        "wires": [
+            [
+                "bd14e7c2be217c24"
+            ]
+        ]
+    },
+    {
+        "id": "bd14e7c2be217c24",
+        "type": "debug",
+        "z": "7fb507cca68e61c2",
+        "name": "debug 1",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "false",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 420,
+        "y": 640,
+        "wires": []
+    }
+]

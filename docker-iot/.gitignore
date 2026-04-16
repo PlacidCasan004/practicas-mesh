@@ -1,5 +1,4 @@
 mariadb/data/
-node-red/data/
 mosquitto/data/
 mosquitto/log/
 *.log
