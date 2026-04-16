@@ -1,0 +1,39 @@
+services:
+  mqtt:
+    image: eclipse-mosquitto:2
+    container_name: mqtt
+    restart: unless-stopped
+    ports:
+      - "1883:1883"
+      - "9001:9001"
+    volumes:
+      - ./mosquitto/config:/mosquitto/config
+      - ./mosquitto/data:/mosquitto/data
+      - ./mosquitto/log:/mosquitto/log
+
+  mariadb:
+    image: mariadb:11
+    container_name: mariadb
+    restart: unless-stopped
+    environment:
+      MARIADB_ROOT_PASSWORD: root123
+      MARIADB_DATABASE: sensores
+      MARIADB_USER: sensores_user
+      MARIADB_PASSWORD: sensores_pass
+    ports:
+      - "3306:3306"
+    volumes:
+      - ./mariadb/data:/var/lib/mysql
+      - ./mariadb/init:/docker-entrypoint-initdb.d
+
+  nodered:
+    image: nodered/node-red:latest
+    container_name: nodered
+    restart: unless-stopped
+    ports:
+      - "1880:1880"
+    volumes:
+      - ./node-red/data:/data
+    depends_on:
+      - mqtt
+      - mariadb
