@@ -52,7 +52,6 @@
 /* Relé */
 #define RELAY_PIN            GPIO_NUM_23
 #define RELAY_ACTIVE_LOW     1
-#define TEMP_UMBRAL          28.0f
 
 typedef struct {
     char topic[MQTT_TOPIC_MAX_LEN];
@@ -60,9 +59,8 @@ typedef struct {
 } mqtt_publish_item_t;
 
 typedef enum {
-    RELAY_MODE_AUTO = 0,
-    RELAY_MODE_MANUAL_ON,
-    RELAY_MODE_MANUAL_OFF
+    RELAY_MODE_MANUAL_OFF = 0,
+    RELAY_MODE_MANUAL_ON
 } relay_mode_t;
 
 typedef struct {
@@ -75,10 +73,6 @@ typedef struct {
 static QueueHandle_t mqtt_queue = NULL;
 static SemaphoreHandle_t sensor_mutex = NULL;
 static SemaphoreHandle_t relay_mutex = NULL;
-
-
-static void publish_root_sensor_snapshot(void);
-
 
 static const char *TAG = "MESH_TEST";
 static const uint8_t MESH_ID[6] = {0x7C, 0xDF, 0xA1, 0x00, 0x00, 0x01};
@@ -95,7 +89,7 @@ static esp_netif_t *netif_ap = NULL;
 
 static bme280_t bme280_dev;
 static sensor_snapshot_t g_sensor_data = {0};
-static relay_mode_t g_relay_mode = RELAY_MODE_AUTO;
+static relay_mode_t g_relay_mode = RELAY_MODE_MANUAL_OFF;
 
 /* Prototipos */
 static void rx_task(void *arg);
@@ -217,12 +211,11 @@ static esp_err_t sensor_init_once(void)
 
 /*
  * process_mesh_command:
- * Ejecuta una orden recibida por mesh en un nodo no-root.
+ * Ejecuta una orden recibida por mesh.
  *
  * Comandos soportados:
  * - RELAY_ON
  * - RELAY_OFF
- * - RELAY_AUTO
  */
 static void process_mesh_command(const char *cmd)
 {
@@ -232,14 +225,11 @@ static void process_mesh_command(const char *cmd)
         if (strcmp(cmd, "RELAY_ON") == 0) {
             g_relay_mode = RELAY_MODE_MANUAL_ON;
             relay_set(true);
-            ESP_LOGI(TAG, "Comando recibido: RELAY_ON -> modo MANUAL_ON");
+            ESP_LOGI(TAG, "Comando recibido: RELAY_ON -> relé encendido");
         } else if (strcmp(cmd, "RELAY_OFF") == 0) {
             g_relay_mode = RELAY_MODE_MANUAL_OFF;
             relay_set(false);
-            ESP_LOGI(TAG, "Comando recibido: RELAY_OFF -> modo MANUAL_OFF");
-        } else if (strcmp(cmd, "RELAY_AUTO") == 0) {
-            g_relay_mode = RELAY_MODE_AUTO;
-            ESP_LOGI(TAG, "Comando recibido: RELAY_AUTO -> modo AUTO");
+            ESP_LOGI(TAG, "Comando recibido: RELAY_OFF -> relé apagado");
         } else {
             ESP_LOGW(TAG, "Comando mesh no reconocido: %s", cmd);
         }
@@ -295,6 +285,8 @@ static bool parse_mac_from_suffix(const char *suffix, mesh_addr_t *addr)
  * forward_mqtt_command_to_mesh_topic:
  * Recibe un topic tipo mesh/cmd/<mac> y un payload tipo RELAY_ON.
  * Extrae la MAC y reenvía la orden por mesh a ese nodo.
+ *
+ * Si el destino es el propio root, ejecuta la orden localmente.
  */
 static void forward_mqtt_command_to_mesh_topic(const char *topic, const char *payload)
 {
@@ -316,6 +308,30 @@ static void forward_mqtt_command_to_mesh_topic(const char *topic, const char *pa
 
     if (!parse_mac_from_suffix(mac_suffix, &dest)) {
         ESP_LOGW(TAG, "MAC inválida en topic: %s", topic);
+        return;
+    }
+
+    uint8_t sta_mac[6];
+    uint8_t ap_mac[6];
+
+    ESP_ERROR_CHECK(esp_wifi_get_mac(WIFI_IF_STA, sta_mac));
+    ESP_ERROR_CHECK(esp_wifi_get_mac(WIFI_IF_AP, ap_mac));
+
+    ESP_LOGI(TAG,
+             "Destino comando=" MACSTR " | local STA=" MACSTR " | local AP=" MACSTR,
+             MAC2STR(dest.addr),
+             MAC2STR(sta_mac),
+             MAC2STR(ap_mac));
+
+    /*
+     * Si el comando va dirigido al propio root, se ejecuta localmente.
+     * Esto contempla tanto la MAC STA como la MAC AP.
+     */
+    if (memcmp(dest.addr, sta_mac, 6) == 0 ||
+        memcmp(dest.addr, ap_mac, 6) == 0) {
+
+        ESP_LOGI(TAG, "Comando MQTT dirigido al nodo ROOT local: %s", payload);
+        process_mesh_command(payload);
         return;
     }
 
@@ -563,8 +579,9 @@ static void mesh_event_handler(void *arg, esp_event_base_t event_base,
 
 /*
  * sensor_relay_task:
- * Lee el BME280, actualiza el estado global y controla el relé.
- * Se ejecuta en todos los nodos.
+ * Lee el BME280 y actualiza el estado global.
+ * El relé NO depende de la temperatura.
+ * El relé solo cambia cuando llega RELAY_ON o RELAY_OFF.
  */
 static void sensor_relay_task(void *arg)
 {
@@ -588,9 +605,8 @@ static void sensor_relay_task(void *arg)
 
         if (res == ESP_OK) {
             float pressure_hpa = pressure / 100.0f;
-            bool relay_on_auto = (temperature >= TEMP_UMBRAL);
-            relay_mode_t current_mode = RELAY_MODE_AUTO;
-            const char *mode_str = "AUTO";
+            relay_mode_t current_mode = RELAY_MODE_MANUAL_OFF;
+            const char *mode_str = "MANUAL_OFF";
             int relay_state = 0;
 
             if (relay_mutex != NULL &&
@@ -599,11 +615,7 @@ static void sensor_relay_task(void *arg)
                 xSemaphoreGive(relay_mutex);
             }
 
-            if (current_mode == RELAY_MODE_AUTO) {
-                relay_set(relay_on_auto);
-                mode_str = "AUTO";
-                relay_state = relay_on_auto ? 1 : 0;
-            } else if (current_mode == RELAY_MODE_MANUAL_ON) {
+            if (current_mode == RELAY_MODE_MANUAL_ON) {
                 relay_set(true);
                 mode_str = "MANUAL_ON";
                 relay_state = 1;
@@ -636,7 +648,6 @@ static void sensor_relay_task(void *arg)
                      mode_str);
         } else {
             ESP_LOGE(TAG, "Error leyendo BME280");
-            relay_set(false);
         }
 
         vTaskDelay(pdMS_TO_TICKS(SENSOR_INTERVAL_MS));
@@ -651,7 +662,7 @@ static void sensor_relay_task(void *arg)
  * - publica el mensaje en mesh/data/<mac_origen>
  *
  * Si este nodo NO es root:
- * - interpreta comandos tipo RELAY_ON / RELAY_OFF / RELAY_AUTO
+ * - interpreta comandos tipo RELAY_ON / RELAY_OFF
  */
 static void rx_task(void *arg)
 {
@@ -688,6 +699,17 @@ static void rx_task(void *arg)
                      MAC2STR(from.addr), (char *)data.data);
 
             if (esp_mesh_is_root()) {
+                /*
+                 * Si el root recibe por mesh un comando de control, no lo publica como dato.
+                 * Los comandos se procesan desde MQTT en forward_mqtt_command_to_mesh_topic().
+                 */
+                if (strcmp((char *)data.data, "RELAY_ON") == 0 ||
+                    strcmp((char *)data.data, "RELAY_OFF") == 0) {
+                    ESP_LOGI(TAG, "Root recibió comando de control desde mesh, no se publica como dato: %s",
+                             (char *)data.data);
+                    continue;
+                }
+
                 if (mqtt_queue != NULL) {
                     mqtt_publish_item_t item;
                     char mac_str[32];
@@ -716,67 +738,6 @@ static void rx_task(void *arg)
     }
 }
 
-
-
-
-static void publish_root_sensor_snapshot(void)
-{
-    if (!esp_mesh_is_root()) {
-        return;
-    }
-
-    if (mqtt_client == NULL || !mqtt_connected) {
-        ESP_LOGW(TAG, "Root con sensor, pero MQTT no conectado");
-        return;
-    }
-
-    char mac_str[32];
-    uint8_t mac[6];
-    char msg[MQTT_MSG_MAX_LEN];
-    char topic[MQTT_TOPIC_MAX_LEN];
-
-    esp_read_mac(mac, ESP_MAC_WIFI_STA);
-    format_mac_no_colons(mac, mac_str, sizeof(mac_str));
-
-    if (sensor_mutex != NULL &&
-        xSemaphoreTake(sensor_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-
-        snprintf(msg, sizeof(msg), "%s", g_sensor_data.payload);
-        xSemaphoreGive(sensor_mutex);
-    } else {
-        ESP_LOGW(TAG, "No se pudo tomar sensor_mutex para publicar desde root");
-        return;
-    }
-
-    if (strlen(msg) == 0) {
-        ESP_LOGW(TAG, "Snapshot vacío en root");
-        return;
-    }
-
-    snprintf(topic, sizeof(topic), "%s/%s", MQTT_DATA_BASE_TOPIC, mac_str);
-
-    int msg_id = esp_mqtt_client_publish(
-        mqtt_client,
-        topic,
-        msg,
-        0,
-        1,
-        0
-    );
-
-    if (msg_id >= 0) {
-        ESP_LOGI(TAG, "Root publicó su propio sensor en MQTT topic %s, msg_id=%d, msg=%s",
-                 topic, msg_id, msg);
-    } else {
-        ESP_LOGW(TAG, "Root no pudo publicar su propio sensor en MQTT");
-    }
-}
-
-
-
-
-
-
 /*
  * tx_task:
  * Envía mensajes por la mesh.
@@ -797,7 +758,7 @@ static void tx_task(void *arg)
     data.tos = MESH_TOS_P2P;
 
     while (1) {
-        if (is_mesh_connected && sensor_ready) {
+        if (is_mesh_connected && !esp_mesh_is_root() && sensor_ready) {
             bool has_data = false;
 
             if (sensor_mutex != NULL &&
@@ -808,17 +769,13 @@ static void tx_task(void *arg)
             }
 
             if (has_data) {
-                if (!esp_mesh_is_root()) {
-                    data.size = strlen(msg) + 1;
+                data.size = strlen(msg) + 1;
 
-                    esp_err_t err = esp_mesh_send(NULL, &data, 0, NULL, 0);
-                    if (err == ESP_OK) {
-                        ESP_LOGI(TAG, "TX sensor hacia arriba: %s", msg);
-                    } else {
-                        ESP_LOGW(TAG, "Error TX: %s", esp_err_to_name(err));
-                    }
+                esp_err_t err = esp_mesh_send(NULL, &data, 0, NULL, 0);
+                if (err == ESP_OK) {
+                    ESP_LOGI(TAG, "TX sensor hacia arriba: %s", msg);
                 } else {
-                    publish_root_sensor_snapshot();
+                    ESP_LOGW(TAG, "Error TX: %s", esp_err_to_name(err));
                 }
             }
         }
@@ -826,8 +783,6 @@ static void tx_task(void *arg)
         vTaskDelay(pdMS_TO_TICKS(TX_INTERVAL_MS));
     }
 }
-
-
 
 /*
  * mqtt_task:
@@ -911,6 +866,16 @@ static void mesh_init(void)
     }
 
     ESP_ERROR_CHECK(esp_wifi_start());
+
+    uint8_t sta_mac[6];
+    uint8_t ap_mac[6];
+
+    ESP_ERROR_CHECK(esp_wifi_get_mac(WIFI_IF_STA, sta_mac));
+    ESP_ERROR_CHECK(esp_wifi_get_mac(WIFI_IF_AP, ap_mac));
+
+    ESP_LOGI(TAG, "MAC STA: " MACSTR, MAC2STR(sta_mac));
+    ESP_LOGI(TAG, "MAC AP : " MACSTR, MAC2STR(ap_mac));
+
     ESP_ERROR_CHECK(esp_mesh_init());
 
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT,
