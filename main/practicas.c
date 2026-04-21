@@ -21,9 +21,10 @@
 #include "driver/gpio.h"
 #include "driver/i2c.h"
 
+#include "node_labels.h"
 #include "bme280.h"
 
-#define RX_SIZE              1500
+#define RX_SIZE              512
 #define TX_INTERVAL_MS       30000
 #define SENSOR_INTERVAL_MS   2000
 #define MESH_MAX_LAYER       3
@@ -39,7 +40,7 @@
 #define MQTT_CMD_BASE_TOPIC  "mesh/cmd"
 
 #define MQTT_QUEUE_LEN       10
-#define MQTT_MSG_MAX_LEN     1500
+#define MQTT_MSG_MAX_LEN     512
 #define MQTT_TOPIC_MAX_LEN   128
 
 /* BME280 */
@@ -115,6 +116,10 @@ static esp_err_t sensor_init_once(void);
 static void format_mac_no_colons(const uint8_t mac[6], char *out, size_t out_size);
 static bool parse_mac_from_suffix(const char *suffix, mesh_addr_t *addr);
 static void forward_mqtt_command_to_mesh_topic(const char *topic, const char *payload);
+
+static const char *get_node_id_from_mac_str(const char *mac_str);
+static void enqueue_mqtt_message(const char *topic, const char *payload);
+static bool split_bme280_payload_to_topics(const mesh_addr_t *from, const char *payload);
 
 /*
  * relay_init:
@@ -248,6 +253,107 @@ static void format_mac_no_colons(const uint8_t mac[6], char *out, size_t out_siz
 {
     snprintf(out, out_size, "%02x%02x%02x%02x%02x%02x",
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+
+/*
+ * get_node_id_from_mac_str:
+ * Busca una MAC en node_labels.h.
+ * Si existe, devuelve el identificador fácil.
+ * Si no existe, devuelve la propia MAC.
+ */
+static const char *get_node_id_from_mac_str(const char *mac_str)
+{
+    for (size_t i = 0; i < NODE_LABELS_COUNT; i++) {
+        if (strcmp(mac_str, NODE_LABELS[i].mac) == 0) {
+            return NODE_LABELS[i].id;
+        }
+    }
+
+    return mac_str;
+}
+
+/*
+ * enqueue_mqtt_message:
+ * Mete un mensaje en la cola MQTT del root.
+ */
+static void enqueue_mqtt_message(const char *topic, const char *payload)
+{
+    if (mqtt_queue == NULL) {
+        ESP_LOGW(TAG, "Cola MQTT no inicializada");
+        return;
+    }
+
+    mqtt_publish_item_t item;
+
+    snprintf(item.topic, sizeof(item.topic), "%s", topic);
+    snprintf(item.payload, sizeof(item.payload), "%s", payload);
+
+    if (xQueueSend(mqtt_queue, &item, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "Cola MQTT llena, mensaje descartado");
+    } else {
+        ESP_LOGI(TAG, "Mensaje metido en cola MQTT para topic %s", item.topic);
+    }
+}
+
+/*
+ * split_bme280_payload_to_topics:
+ * Separa el JSON del BME280 en topics diferentes:
+ *
+ * mesh/data/<node_id>/temperature
+ * mesh/data/<node_id>/pressure
+ * mesh/data/<node_id>/humidity
+ */
+static bool split_bme280_payload_to_topics(const mesh_addr_t *from, const char *payload)
+{
+    char mac_str[32];
+    const char *node_id;
+
+    float temperature = 0.0f;
+    float pressure_hpa = 0.0f;
+    float humidity = 0.0f;
+    int relay = 0;
+    int layer = 0;
+    char mode[32] = {0};
+
+    format_mac_no_colons(from->addr, mac_str, sizeof(mac_str));
+    node_id = get_node_id_from_mac_str(mac_str);
+
+    int parsed = sscanf(payload,
+                        "{\"temperature\":%f,\"pressure_hpa\":%f,\"humidity\":%f,\"relay\":%d,\"mode\":\"%31[^\"]\",\"layer\":%d}",
+                        &temperature,
+                        &pressure_hpa,
+                        &humidity,
+                        &relay,
+                        mode,
+                        &layer);
+
+    if (parsed != 6) {
+        ESP_LOGW(TAG, "No se pudo separar payload BME280: %s", payload);
+        return false;
+    }
+
+    char topic[MQTT_TOPIC_MAX_LEN];
+    char msg[MQTT_MSG_MAX_LEN];
+
+    snprintf(topic, sizeof(topic), "%s/%s/temperature", MQTT_DATA_BASE_TOPIC, node_id);
+    snprintf(msg, sizeof(msg),
+             "{\"node\":\"%s\",\"sensor\":\"temperature\",\"value\":%.2f,\"unit\":\"C\",\"relay\":%d,\"mode\":\"%s\",\"layer\":%d}",
+             node_id, temperature, relay, mode, layer);
+    enqueue_mqtt_message(topic, msg);
+
+    snprintf(topic, sizeof(topic), "%s/%s/pressure", MQTT_DATA_BASE_TOPIC, node_id);
+    snprintf(msg, sizeof(msg),
+             "{\"node\":\"%s\",\"sensor\":\"pressure\",\"value\":%.2f,\"unit\":\"hPa\",\"relay\":%d,\"mode\":\"%s\",\"layer\":%d}",
+             node_id, pressure_hpa, relay, mode, layer);
+    enqueue_mqtt_message(topic, msg);
+
+    snprintf(topic, sizeof(topic), "%s/%s/humidity", MQTT_DATA_BASE_TOPIC, node_id);
+    snprintf(msg, sizeof(msg),
+             "{\"node\":\"%s\",\"sensor\":\"humidity\",\"value\":%.2f,\"unit\":\"%%\",\"relay\":%d,\"mode\":\"%s\",\"layer\":%d}",
+             node_id, humidity, relay, mode, layer);
+    enqueue_mqtt_message(topic, msg);
+
+    return true;
 }
 
 /*
@@ -390,11 +496,11 @@ static void start_mesh_tasks_once(void)
         }
     }
 
-    BaseType_t ok1 = xTaskCreate(rx_task, "rx_task", 4096, NULL, 5, NULL);
-    BaseType_t ok2 = xTaskCreate(tx_task, "tx_task", 4096, NULL, 5, NULL);
-    BaseType_t ok3 = xTaskCreate(mqtt_task, "mqtt_task", 4096, NULL, 5, NULL);
-    BaseType_t ok4 = xTaskCreate(sensor_relay_task, "sensor_relay_task", 6144, NULL, 5, NULL);
-
+    BaseType_t ok1 = xTaskCreate(rx_task, "rx_task", 12288, NULL, 5, NULL);
+    BaseType_t ok2 = xTaskCreate(tx_task, "tx_task", 8192, NULL, 5, NULL);
+    BaseType_t ok3 = xTaskCreate(mqtt_task, "mqtt_task", 8192, NULL, 5, NULL);
+    BaseType_t ok4 = xTaskCreate(sensor_relay_task, "sensor_relay_task", 8192, NULL, 5, NULL);
+    
     if (ok1 != pdPASS || ok2 != pdPASS || ok3 != pdPASS || ok4 != pdPASS) {
         ESP_LOGE(TAG, "No se pudieron crear todas las tareas");
         return;
@@ -521,7 +627,11 @@ static void mesh_event_handler(void *arg, esp_event_base_t event_base,
                 ESP_LOGI(TAG, "Conectado a mesh (%s), layer=%d",
                          esp_mesh_is_root() ? "ROOT" : "NODE",
                          esp_mesh_get_layer());
+		mesh_addr_t parent_addr;
+		esp_mesh_get_parent_bssid(&parent_addr);
 
+		ESP_LOGI(TAG, "Parent BSSID: " MACSTR, MAC2STR(parent_addr.addr));
+		
                 if (esp_mesh_is_root() && netif_sta != NULL) {
                     esp_err_t err;
 
@@ -659,10 +769,10 @@ static void sensor_relay_task(void *arg)
  * Espera mensajes que llegan por la mesh.
  *
  * Si este nodo es root:
- * - publica el mensaje en mesh/data/<mac_origen>
+ * - separa mensajes BME280 en topics diferentes.
  *
  * Si este nodo NO es root:
- * - interpreta comandos tipo RELAY_ON / RELAY_OFF
+ * - interpreta comandos tipo RELAY_ON / RELAY_OFF.
  */
 static void rx_task(void *arg)
 {
@@ -700,8 +810,8 @@ static void rx_task(void *arg)
 
             if (esp_mesh_is_root()) {
                 /*
-                 * Si el root recibe por mesh un comando de control, no lo publica como dato.
-                 * Los comandos se procesan desde MQTT en forward_mqtt_command_to_mesh_topic().
+                 * Si el root recibe por mesh un comando de control,
+                 * no lo publica como dato.
                  */
                 if (strcmp((char *)data.data, "RELAY_ON") == 0 ||
                     strcmp((char *)data.data, "RELAY_OFF") == 0) {
@@ -710,26 +820,25 @@ static void rx_task(void *arg)
                     continue;
                 }
 
-                if (mqtt_queue != NULL) {
-                    mqtt_publish_item_t item;
+                /*
+                 * Si el mensaje es un JSON del BME280, se separa por medición.
+                 */
+                bool separated = split_bme280_payload_to_topics(&from, (char *)data.data);
+
+                if (!separated) {
+                    /*
+                     * Fallback: si no se puede separar, se publica en raw usando etiqueta.
+                     */
                     char mac_str[32];
+                    const char *node_id;
+                    char topic[MQTT_TOPIC_MAX_LEN];
 
                     format_mac_no_colons(from.addr, mac_str, sizeof(mac_str));
-                    snprintf(item.topic, sizeof(item.topic), "%s/%s", MQTT_DATA_BASE_TOPIC, mac_str);
+                    node_id = get_node_id_from_mac_str(mac_str);
 
-                    size_t copy_len = data.size;
-                    if (copy_len >= sizeof(item.payload)) {
-                        copy_len = sizeof(item.payload) - 1;
-                    }
+                    snprintf(topic, sizeof(topic), "%s/%s/raw", MQTT_DATA_BASE_TOPIC, node_id);
 
-                    memcpy(item.payload, data.data, copy_len);
-                    item.payload[copy_len] = '\0';
-
-                    if (xQueueSend(mqtt_queue, &item, 0) != pdTRUE) {
-                        ESP_LOGW(TAG, "Cola MQTT llena, mensaje descartado");
-                    } else {
-                        ESP_LOGI(TAG, "Mensaje metido en cola MQTT para topic %s", item.topic);
-                    }
+                    enqueue_mqtt_message(topic, (char *)data.data);
                 }
             } else {
                 process_mesh_command((char *)data.data);
@@ -742,9 +851,9 @@ static void rx_task(void *arg)
  * tx_task:
  * Envía mensajes por la mesh.
  *
- * - solo los nodos NO root envían
- * - envían hacia arriba con esp_mesh_send(NULL, ...)
- * - se envía el último snapshot del BME280
+ * - solo los nodos NO root envían.
+ * - envían hacia arriba con esp_mesh_send(NULL, ...).
+ * - se envía el último snapshot del BME280.
  */
 static void tx_task(void *arg)
 {
@@ -758,7 +867,7 @@ static void tx_task(void *arg)
     data.tos = MESH_TOS_P2P;
 
     while (1) {
-        if (is_mesh_connected && !esp_mesh_is_root() && sensor_ready) {
+        if (is_mesh_connected && sensor_ready) {
             bool has_data = false;
 
             if (sensor_mutex != NULL &&
@@ -769,13 +878,37 @@ static void tx_task(void *arg)
             }
 
             if (has_data) {
-                data.size = strlen(msg) + 1;
+                if (!esp_mesh_is_root()) {
+                    data.size = strlen(msg) + 1;
 
-                esp_err_t err = esp_mesh_send(NULL, &data, 0, NULL, 0);
-                if (err == ESP_OK) {
-                    ESP_LOGI(TAG, "TX sensor hacia arriba: %s", msg);
+                    esp_err_t err = esp_mesh_send(NULL, &data, 0, NULL, 0);
+                    if (err == ESP_OK) {
+                        ESP_LOGI(TAG, "TX sensor hacia arriba: %s", msg);
+                    } else {
+                        ESP_LOGW(TAG, "Error TX: %s", esp_err_to_name(err));
+                    }
                 } else {
-                    ESP_LOGW(TAG, "Error TX: %s", esp_err_to_name(err));
+                    mesh_addr_t self_addr;
+                    uint8_t mac[6];
+
+                    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+                    memcpy(self_addr.addr, mac, 6);
+
+                    ESP_LOGI(TAG, "ROOT publica su propio sensor: %s", msg);
+
+                    bool separated = split_bme280_payload_to_topics(&self_addr, msg);
+
+                    if (!separated) {
+                        char mac_str[32];
+                        const char *node_id;
+                        char topic[MQTT_TOPIC_MAX_LEN];
+
+                        format_mac_no_colons(self_addr.addr, mac_str, sizeof(mac_str));
+                        node_id = get_node_id_from_mac_str(mac_str);
+
+                        snprintf(topic, sizeof(topic), "%s/%s/raw", MQTT_DATA_BASE_TOPIC, node_id);
+                        enqueue_mqtt_message(topic, msg);
+                    }
                 }
             }
         }
@@ -783,7 +916,6 @@ static void tx_task(void *arg)
         vTaskDelay(pdMS_TO_TICKS(TX_INTERVAL_MS));
     }
 }
-
 /*
  * mqtt_task:
  * Espera mensajes en la cola y los publica en el broker MQTT.
@@ -904,6 +1036,7 @@ static void mesh_init(void)
     ESP_ERROR_CHECK(esp_mesh_set_ap_authmode(WIFI_AUTH_WPA2_PSK));
 
     ESP_ERROR_CHECK(esp_mesh_set_config(&cfg));
+    ESP_ERROR_CHECK(esp_mesh_set_self_organized(true, true));
     ESP_ERROR_CHECK(esp_mesh_start());
 
     ESP_LOGI(TAG, "Mesh arrancada");
