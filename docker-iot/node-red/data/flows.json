@@ -59,11 +59,100 @@
         "charset": "UTF8"
     },
     {
+        "id": "e95b9f49f02142c0",
+        "type": "ui-base",
+        "name": "My Dashboard",
+        "path": "/dashboard",
+        "appIcon": "",
+        "includeClientData": true,
+        "acceptsClientConfig": [
+            "ui-notification",
+            "ui-control"
+        ],
+        "showPathInSidebar": false,
+        "headerContent": "page",
+        "navigationStyle": "default",
+        "titleBarStyle": "default",
+        "showReconnectNotification": true,
+        "notificationDisplayTime": 1,
+        "showDisconnectNotification": true,
+        "allowInstall": false
+    },
+    {
+        "id": "74eb7017d11c4df5",
+        "type": "ui-theme",
+        "name": "Default Theme",
+        "colors": {
+            "surface": "#ffffff",
+            "primary": "#0094CE",
+            "bgPage": "#eeeeee",
+            "groupBg": "#ffffff",
+            "groupOutline": "#cccccc"
+        },
+        "sizes": {
+            "density": "default",
+            "pagePadding": "12px",
+            "groupGap": "12px",
+            "groupBorderRadius": "4px",
+            "widgetGap": "12px"
+        }
+    },
+    {
+        "id": "3de93e1638bfe11b",
+        "type": "ui-page",
+        "name": "Page 1",
+        "ui": "e95b9f49f02142c0",
+        "path": "/page1",
+        "icon": "home",
+        "layout": "grid",
+        "theme": "74eb7017d11c4df5",
+        "breakpoints": [
+            {
+                "name": "Default",
+                "px": 0,
+                "cols": 3
+            },
+            {
+                "name": "Tablet",
+                "px": 576,
+                "cols": 6
+            },
+            {
+                "name": "Small Desktop",
+                "px": 768,
+                "cols": 9
+            },
+            {
+                "name": "Desktop",
+                "px": 1024,
+                "cols": 12
+            }
+        ],
+        "order": 1,
+        "className": "",
+        "visible": "true",
+        "disabled": "false"
+    },
+    {
+        "id": "206eebc07beb0f92",
+        "type": "ui-group",
+        "name": "Group 1",
+        "page": "3de93e1638bfe11b",
+        "width": 6,
+        "height": 1,
+        "order": 1,
+        "showTitle": true,
+        "className": "",
+        "visible": true,
+        "disabled": false,
+        "groupType": "default"
+    },
+    {
         "id": "9130444dd322565b",
         "type": "mqtt in",
         "z": "7fb507cca68e61c2",
         "name": "",
-        "topic": "mesh/data/#",
+        "topic": "mesh/data/+/+",
         "qos": "2",
         "datatype": "auto-detect",
         "broker": "cf75a0e530b20b46",
@@ -91,27 +180,7 @@
         "y": 180,
         "wires": [
             [
-                "d5986f9c34769328"
-            ]
-        ]
-    },
-    {
-        "id": "d5986f9c34769328",
-        "type": "function",
-        "z": "7fb507cca68e61c2",
-        "name": "function 1",
-        "func": "let partes = msg.topic.split(\"/\");\nlet nodo = partes[partes.length - 1];\n\nlet d = msg.payload;\n\nmsg.topic = `\nINSERT INTO mediciones_completas\n(nodo, temperature, pressure_hpa, humidity, relay, mode, layer)\nVALUES (?, ?, ?, ?, ?, ?, ?)\n`;\n\nmsg.payload = [\n    nodo,\n    d.temperature ?? null,\n    d.pressure_hpa ?? null,\n    d.humidity ?? null,\n    d.relay ?? null,\n    d.mode ?? null,\n    d.layer ?? null\n];\n\nreturn msg;",
-        "outputs": 1,
-        "timeout": 0,
-        "noerr": 0,
-        "initialize": "",
-        "finalize": "",
-        "libs": [],
-        "x": 160,
-        "y": 340,
-        "wires": [
-            [
-                "7bd0487d6bc22bb3"
+                "c3646e6eb863dfaf"
             ]
         ]
     },
@@ -121,11 +190,12 @@
         "z": "7fb507cca68e61c2",
         "mydb": "5e3077a49e0c273e",
         "name": "",
-        "x": 400,
-        "y": 340,
+        "x": 760,
+        "y": 480,
         "wires": [
             [
-                "bd14e7c2be217c24"
+                "bd14e7c2be217c24",
+                "be276125d1fb5089"
             ]
         ]
     },
@@ -138,11 +208,258 @@
         "tosidebar": true,
         "console": false,
         "tostatus": false,
+        "complete": "payload",
+        "targetType": "msg",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 820,
+        "y": 640,
+        "wires": []
+    },
+    {
+        "id": "c3646e6eb863dfaf",
+        "type": "switch",
+        "z": "7fb507cca68e61c2",
+        "name": "",
+        "property": "payload.sensor",
+        "propertyType": "msg",
+        "rules": [
+            {
+                "t": "eq",
+                "v": "temperature",
+                "vt": "str"
+            },
+            {
+                "t": "eq",
+                "v": "pressure",
+                "vt": "str"
+            },
+            {
+                "t": "eq",
+                "v": "humidity",
+                "vt": "str"
+            }
+        ],
+        "checkall": "true",
+        "repair": false,
+        "outputs": 3,
+        "x": 210,
+        "y": 360,
+        "wires": [
+            [
+                "79b2e13530987a29"
+            ],
+            [
+                "3c45c8daeaad8827"
+            ],
+            [
+                "eb4b5319e3033cc3"
+            ]
+        ]
+    },
+    {
+        "id": "79b2e13530987a29",
+        "type": "function",
+        "z": "7fb507cca68e61c2",
+        "name": "SQL temperature",
+        "func": "msg.topic = `\nINSERT INTO temperature_measurements\n(node_id, sensor, value, unit, relay_state, mode, layer)\nVALUES (?, ?, ?, ?, ?, ?, ?)\n`;\n\nmsg.payload = [\n    msg.payload.node,\n    msg.payload.sensor,\n    msg.payload.value,\n    msg.payload.unit,\n    msg.payload.relay,\n    msg.payload.mode,\n    msg.payload.layer\n];\n\nreturn msg;",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 490,
+        "y": 280,
+        "wires": [
+            [
+                "7bd0487d6bc22bb3"
+            ]
+        ]
+    },
+    {
+        "id": "3c45c8daeaad8827",
+        "type": "function",
+        "z": "7fb507cca68e61c2",
+        "name": "SQL pressure",
+        "func": "msg.topic = `\nINSERT INTO pressure_measurements\n(node_id, sensor, value, unit, relay_state, mode, layer)\nVALUES (?, ?, ?, ?, ?, ?, ?)\n`;\n\nmsg.payload = [\n    msg.payload.node,\n    msg.payload.sensor,\n    msg.payload.value,\n    msg.payload.unit,\n    msg.payload.relay,\n    msg.payload.mode,\n    msg.payload.layer\n];\n\nreturn msg;",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 480,
+        "y": 360,
+        "wires": [
+            [
+                "7bd0487d6bc22bb3"
+            ]
+        ]
+    },
+    {
+        "id": "eb4b5319e3033cc3",
+        "type": "function",
+        "z": "7fb507cca68e61c2",
+        "name": "SQL humidity",
+        "func": "msg.topic = `\nINSERT INTO humidity_measurements\n(node_id, sensor, value, unit, relay_state, mode, layer)\nVALUES (?, ?, ?, ?, ?, ?, ?)\n`;\n\nmsg.payload = [\n    msg.payload.node,\n    msg.payload.sensor,\n    msg.payload.value,\n    msg.payload.unit,\n    msg.payload.relay,\n    msg.payload.mode,\n    msg.payload.layer\n];\n\nreturn msg;",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 480,
+        "y": 420,
+        "wires": [
+            [
+                "7bd0487d6bc22bb3"
+            ]
+        ]
+    },
+    {
+        "id": "6a4e25fda52c60d3",
+        "type": "mqtt in",
+        "z": "7fb507cca68e61c2",
+        "name": "",
+        "topic": "mesh/config/request",
+        "qos": "2",
+        "datatype": "auto-detect",
+        "broker": "cf75a0e530b20b46",
+        "nl": false,
+        "rap": true,
+        "rh": 0,
+        "inputs": 0,
+        "x": 150,
+        "y": 540,
+        "wires": [
+            [
+                "4b90320952994d82"
+            ]
+        ]
+    },
+    {
+        "id": "4b90320952994d82",
+        "type": "json",
+        "z": "7fb507cca68e61c2",
+        "name": "",
+        "property": "payload",
+        "action": "obj",
+        "pretty": false,
+        "x": 150,
+        "y": 640,
+        "wires": [
+            [
+                "8a2c498ee3d59ddc",
+                "a90cdf49781d178b"
+            ]
+        ]
+    },
+    {
+        "id": "8a2c498ee3d59ddc",
+        "type": "function",
+        "z": "7fb507cca68e61c2",
+        "name": "function 1",
+        "func": "if (!msg.payload || !msg.payload.mac) {\n    return null;\n}\n\nmsg.mac = msg.payload.mac.trim();\nmsg.topic = \"SELECT * FROM nodos WHERE mac = '\" + msg.mac + \"'\";\nreturn msg;",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 400,
+        "y": 660,
+        "wires": [
+            [
+                "7bd0487d6bc22bb3"
+            ]
+        ]
+    },
+    {
+        "id": "be276125d1fb5089",
+        "type": "function",
+        "z": "7fb507cca68e61c2",
+        "name": "construir respuesta config",
+        "func": "if (!msg.payload || msg.payload.length === 0) {\n    return null;\n}\n\nlet row = msg.payload[0];\n\nif (!row || !row.mac) {\n    return null;\n}\n\nlet mac_sin_puntos = String(row.mac).replace(/:/g, \"\");\n\nmsg.topic = \"mesh/config/\" + mac_sin_puntos;\n\nmsg.payload = {\n    mac: row.mac,\n    tipo_nodo: row.tipo_nodo,\n    sensores: JSON.parse(row.sensores_json || \"[]\"),\n    topic_pub: row.topic_pub,\n    topic_sub: row.topic_sub\n};\n\nreturn msg;",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 1130,
+        "y": 380,
+        "wires": [
+            [
+                "8dc0c4422c24f40e",
+                "33ac6c5000b6006a"
+            ]
+        ]
+    },
+    {
+        "id": "8dc0c4422c24f40e",
+        "type": "json",
+        "z": "7fb507cca68e61c2",
+        "name": "",
+        "property": "payload",
+        "action": "",
+        "pretty": false,
+        "x": 1340,
+        "y": 340,
+        "wires": [
+            [
+                "4ee51b9df2ba4c13"
+            ]
+        ]
+    },
+    {
+        "id": "4ee51b9df2ba4c13",
+        "type": "mqtt out",
+        "z": "7fb507cca68e61c2",
+        "name": "",
+        "topic": "",
+        "qos": "",
+        "retain": "",
+        "respTopic": "",
+        "contentType": "",
+        "userProps": "",
+        "correl": "",
+        "expiry": "",
+        "broker": "cf75a0e530b20b46",
+        "x": 1510,
+        "y": 360,
+        "wires": []
+    },
+    {
+        "id": "a90cdf49781d178b",
+        "type": "debug",
+        "z": "7fb507cca68e61c2",
+        "name": "debug 2",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
         "complete": "false",
         "statusVal": "",
         "statusType": "auto",
-        "x": 420,
-        "y": 640,
+        "x": 410,
+        "y": 760,
+        "wires": []
+    },
+    {
+        "id": "33ac6c5000b6006a",
+        "type": "debug",
+        "z": "7fb507cca68e61c2",
+        "name": "debug 3",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "false",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 1300,
+        "y": 440,
         "wires": []
     }
 ]
