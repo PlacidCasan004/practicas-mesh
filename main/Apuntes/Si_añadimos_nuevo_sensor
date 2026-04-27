@@ -1,0 +1,135 @@
+1. Base de datos
+
+Añadir al nodo el nuevo elemento en sensores_json o reflejar que además tiene un actuador.
+
+Por ejemplo, si añades un sensor de luz:
+
+[
+  {"tipo":"temperatura"},
+  {"tipo":"humedad"},
+  {"tipo":"presion"},
+  {"tipo":"luz"}
+]
+
+Si añades un actuador bomba, puedes hacer una de estas dos cosas:
+
+meterlo también en sensores_json, por ejemplo {"tipo":"bomba"}
+o usar tipo_nodo más específico, por ejemplo sensor_actuador_bomba
+
+La opción más escalable es tratar todo como “capacidades” del nodo, o sea, lista de cosas que tiene.
+
+2. Firmware
+
+Aquí está el cambio importante. Tendrías que:
+
+Añadir flags nuevas
+
+Por ejemplo:
+
+static bool g_has_luz = false;
+static bool g_has_bomba = false;
+Ampliar apply_node_config()
+
+Ahora mismo detectas:
+
+temperatura
+humedad
+presion
+
+Tendrías que añadir casos nuevos, por ejemplo:
+
+if (strcmp(tipo->valuestring, "luz") == 0) {
+    g_has_luz = true;
+} else if (strcmp(tipo->valuestring, "bomba") == 0) {
+    g_has_bomba = true;
+}
+Crear la lógica o tarea nueva
+
+Por ejemplo:
+
+task_luz() para leer un sensor de luz
+task_bomba() o lógica de control para una bomba
+
+Y luego decidir cuándo arrancarla:
+
+si g_has_luz es true → arrancas la tarea de luz
+si g_has_bomba es true → habilitas el control de la bomba
+3. Hardware y driver
+
+Además del software, tendrías que añadir:
+
+el cableado del nuevo sensor o actuador
+su librería o driver si hace falta
+la inicialización correspondiente
+
+Por ejemplo:
+
+si es un sensor I2C, igual que el BME280, necesitarás su driver
+si es un actuador en GPIO, tendrás que configurar el pin
+si usa ADC, UART o SPI, tendrás que programar esa interfaz
+En resumen práctico
+
+Si mañana añades un sensor o actuador nuevo, el proceso sería:
+
+Para un sensor nuevo
+conectarlo físicamente
+añadir su tipo en la BD
+añadir una bandera nueva en el firmware
+detectar ese tipo en apply_node_config()
+crear su tarea de lectura
+arrancarla solo si la config lo indica
+Para un actuador nuevo
+conectarlo físicamente
+añadir su tipo en la BD
+añadir una bandera nueva en el firmware
+detectar ese tipo en apply_node_config()
+crear la lógica de control
+hacer que responda a comandos solo si ese actuador existe en ese nodo
+Lo bueno de lo que ya tienes
+
+Ahora mismo ya has construido el patrón general:
+
+la BD describe
+Node-RED entrega la config
+el firmware decide qué activar
+
+Así que añadir cosas nuevas ya no es rehacer el sistema, sino ampliar la lista de capacidades.
+
+Ejemplo real
+
+Si quisieras añadir un sensor A y un actuador B:
+
+En la BD
+[
+  {"tipo":"sensor_a"},
+  {"tipo":"actuador_b"}
+]
+En firmware
+
+Añades:
+
+static bool g_has_sensor_a = false;
+static bool g_has_actuador_b = false;
+
+En apply_node_config():
+
+if (strcmp(tipo->valuestring, "sensor_a") == 0) {
+    g_has_sensor_a = true;
+} else if (strcmp(tipo->valuestring, "actuador_b") == 0) {
+    g_has_actuador_b = true;
+}
+
+Y luego:
+
+si g_has_sensor_a → arrancas task_sensor_a()
+si g_has_actuador_b → habilitas comandos del actuador B
+Qué cambiarías menos
+
+Node-RED casi no tendrías que tocarlo si ya devuelve el JSON completo de la BD.
+Los cambios de verdad estarían sobre todo en:
+
+la BD
+el firmware
+el hardware
+
+Si quieres, el siguiente paso te lo puedo dejar ya con una estructura genérica limpia para que no tengas que ir creando variables sueltas una a una cada vez que añadas un sensor nuevo.

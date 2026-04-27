@@ -63,6 +63,9 @@ PORQUE SOLO SE VE UN NODO DE MOMENTO EN LA BASE DE DATOS
 
 
 
+Para saber la configuración de un nodo en base a su MAC:
+El nodo se identifica por su MAC, Node-RED busca esa MAC en la base de datos y le devuelve por MQTT la configuración que tiene guardada.
+
 
 
 
@@ -78,3 +81,32 @@ que esa red existe
 en qué canal está
 con qué parámetros trabaja
 y, en mesh, ayuda a descubrir y mantener vecinos o parent
+
+
+
+
+
+
+
+
+
+
+Cómo introducir un nuevo nodo y su configuración
+
+1. Entrar en MariaDB
+docker exec -it mariadb mariadb -u root -p
+2. Elegir la base
+USE sensores;
+3. Ver los nodos actuales
+SELECT * FROM nodos;
+4. Insertar un nodo nuevo
+INSERT INTO nodos (mac, tipo_nodo, sensores_json, topic_pub, topic_sub)
+VALUES (
+    'AA:BB:CC:DD:EE:FF',
+    'sensor',
+    '[{"tipo":"temperatura"},{"tipo":"humedad"}]',
+    'mesh/data/AA:BB:CC:DD:EE:FF',
+    'mesh/cmd/AA:BB:CC:DD:EE:FF'
+);
+5. Comprobar que se guardó
+SELECT * FROM nodos;

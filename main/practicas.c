@@ -23,36 +23,45 @@
 
 #include "node_labels.h"
 #include "bme280.h"
+#include "cJSON.h"
 
-#define RX_SIZE              512
-#define TX_INTERVAL_MS       30000
-#define SENSOR_INTERVAL_MS   2000
-#define MESH_MAX_LAYER       3
+#define RX_SIZE                512
+#define TX_INTERVAL_MS         30000
+#define SENSOR_INTERVAL_MS     2000
+#define MESH_MAX_LAYER         3
 
-#define ROUTER_SSID          "WLAN_48"
-#define ROUTER_PASS          "tequieromuchocartucho"
-#define ROUTER_CHANNEL       2
+#define ROUTER_SSID            "WLAN_48"
+#define ROUTER_PASS            "tequieromuchocartucho"
+#define ROUTER_CHANNEL         2
 
-#define MQTT_BROKER_URI      "mqtt://192.168.1.101"
+#define MQTT_BROKER_URI        "mqtt://192.168.1.101"
 
-/* Topic base */
-#define MQTT_DATA_BASE_TOPIC "mesh/data"
-#define MQTT_CMD_BASE_TOPIC  "mesh/cmd"
+/* Topics MQTT */
+#define MQTT_DATA_BASE_TOPIC       "mesh/data"
+#define MQTT_CMD_BASE_TOPIC        "mesh/cmd"
+#define MQTT_CONFIG_REQUEST_TOPIC  "mesh/config/request"
+#define MQTT_CONFIG_BASE_TOPIC     "mesh/config"
 
-#define MQTT_QUEUE_LEN       10
-#define MQTT_MSG_MAX_LEN     512
-#define MQTT_TOPIC_MAX_LEN   128
+/* Configuración por mesh */
+#define CONFIG_RETRY_MS            10000
+#define MESH_CFG_REQ_MSG           "CFG_REQ"
+#define MESH_CFG_RSP_PREFIX        "CFG_RSP:"
+
+/* Límites */
+#define MQTT_QUEUE_LEN         10
+#define MQTT_MSG_MAX_LEN       512
+#define MQTT_TOPIC_MAX_LEN     128
 
 /* BME280 */
-#define I2C_MASTER_SCL_IO    22
-#define I2C_MASTER_SDA_IO    21
-#define I2C_MASTER_NUM       I2C_NUM_0
-#define I2C_MASTER_FREQ_HZ   100000
-#define BME280_I2C_ADDRESS   0x76
+#define I2C_MASTER_SCL_IO      22
+#define I2C_MASTER_SDA_IO      21
+#define I2C_MASTER_NUM         I2C_NUM_0
+#define I2C_MASTER_FREQ_HZ     100000
+#define BME280_I2C_ADDRESS     0x76
 
 /* Relé */
-#define RELAY_PIN            GPIO_NUM_23
-#define RELAY_ACTIVE_LOW     1
+#define RELAY_PIN              GPIO_NUM_23
+#define RELAY_ACTIVE_LOW       1
 
 typedef struct {
     char topic[MQTT_TOPIC_MAX_LEN];
@@ -83,6 +92,12 @@ static bool mqtt_started = false;
 static bool mqtt_connected = false;
 static bool sensor_ready = false;
 static bool i2c_driver_installed = false;
+static bool g_config_received = false;
+static bool g_has_config = false;
+static bool g_has_bme280 = false;
+static bool g_has_temperature = false;
+static bool g_has_humidity = false;
+static bool g_has_pressure = false;
 
 static esp_mqtt_client_handle_t mqtt_client = NULL;
 static esp_netif_t *netif_sta = NULL;
@@ -92,11 +107,20 @@ static bme280_t bme280_dev;
 static sensor_snapshot_t g_sensor_data = {0};
 static relay_mode_t g_relay_mode = RELAY_MODE_MANUAL_OFF;
 
+static char g_mac_colon[18] = {0};
+static char g_mac_no_colons[13] = {0};
+static char g_config_topic[64] = {0};
+
+static char g_tipo_nodo[32] = {0};
+static char g_topic_pub_cfg[MQTT_TOPIC_MAX_LEN] = {0};
+static char g_topic_sub_cfg[MQTT_TOPIC_MAX_LEN] = {0};
+
 /* Prototipos */
 static void rx_task(void *arg);
 static void tx_task(void *arg);
 static void mqtt_task(void *arg);
 static void sensor_relay_task(void *arg);
+static void config_request_task(void *arg);
 
 static void start_mesh_tasks_once(void);
 static void mqtt_app_start(void);
@@ -113,13 +137,21 @@ static void process_mesh_command(const char *cmd);
 static void i2c_master_init_once(void);
 static esp_err_t sensor_init_once(void);
 
+static void format_mac_with_colons(const uint8_t mac[6], char *out, size_t out_size);
 static void format_mac_no_colons(const uint8_t mac[6], char *out, size_t out_size);
 static bool parse_mac_from_suffix(const char *suffix, mesh_addr_t *addr);
 static void forward_mqtt_command_to_mesh_topic(const char *topic, const char *payload);
 
+static void request_config_via_mqtt_for_mac(const uint8_t mac[6]);
+static void request_config_from_root_over_mesh(void);
+static void forward_config_response_to_mesh_node(const char *mac_suffix, const char *json_payload);
+
 static const char *get_node_id_from_mac_str(const char *mac_str);
 static void enqueue_mqtt_message(const char *topic, const char *payload);
 static bool split_bme280_payload_to_topics(const mesh_addr_t *from, const char *payload);
+
+static void reset_node_capabilities(void);
+static bool apply_node_config(const char *json_cfg);
 
 /*
  * relay_init:
@@ -217,10 +249,6 @@ static esp_err_t sensor_init_once(void)
 /*
  * process_mesh_command:
  * Ejecuta una orden recibida por mesh.
- *
- * Comandos soportados:
- * - RELAY_ON
- * - RELAY_OFF
  */
 static void process_mesh_command(const char *cmd)
 {
@@ -246,8 +274,18 @@ static void process_mesh_command(const char *cmd)
 }
 
 /*
+ * format_mac_with_colons:
+ * Convierte una MAC a texto con ':'.
+ */
+static void format_mac_with_colons(const uint8_t mac[6], char *out, size_t out_size)
+{
+    snprintf(out, out_size, "%02x:%02x:%02x:%02x:%02x:%02x",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+
+/*
  * format_mac_no_colons:
- * Convierte una MAC a texto sin ':' para usarla en topics MQTT.
+ * Convierte una MAC a texto sin ':'.
  */
 static void format_mac_no_colons(const uint8_t mac[6], char *out, size_t out_size)
 {
@@ -256,10 +294,179 @@ static void format_mac_no_colons(const uint8_t mac[6], char *out, size_t out_siz
 }
 
 /*
+ * reset_node_capabilities:
+ * Limpia la configuración de capacidades del nodo.
+ */
+static void reset_node_capabilities(void)
+{
+    g_has_bme280 = false;
+    g_has_temperature = false;
+    g_has_humidity = false;
+    g_has_pressure = false;
+
+    g_tipo_nodo[0] = '\0';
+    g_topic_pub_cfg[0] = '\0';
+    g_topic_sub_cfg[0] = '\0';
+}
+
+/*
+ * apply_node_config:
+ * Parsea la configuración recibida y activa capacidades del nodo.
+ */
+static bool apply_node_config(const char *json_cfg)
+{
+    cJSON *root = cJSON_Parse(json_cfg);
+    if (root == NULL) {
+        ESP_LOGW(TAG, "No se pudo parsear la configuración JSON");
+        return false;
+    }
+
+    reset_node_capabilities();
+
+    cJSON *tipo_nodo = cJSON_GetObjectItem(root, "tipo_nodo");
+    if (cJSON_IsString(tipo_nodo) && tipo_nodo->valuestring != NULL) {
+        snprintf(g_tipo_nodo, sizeof(g_tipo_nodo), "%s", tipo_nodo->valuestring);
+    }
+
+    cJSON *topic_pub = cJSON_GetObjectItem(root, "topic_pub");
+    if (cJSON_IsString(topic_pub) && topic_pub->valuestring != NULL) {
+        snprintf(g_topic_pub_cfg, sizeof(g_topic_pub_cfg), "%s", topic_pub->valuestring);
+    }
+
+    cJSON *topic_sub = cJSON_GetObjectItem(root, "topic_sub");
+    if (cJSON_IsString(topic_sub) && topic_sub->valuestring != NULL) {
+        snprintf(g_topic_sub_cfg, sizeof(g_topic_sub_cfg), "%s", topic_sub->valuestring);
+    }
+
+    cJSON *sensores = cJSON_GetObjectItem(root, "sensores");
+    if (cJSON_IsArray(sensores)) {
+        int n = cJSON_GetArraySize(sensores);
+
+        for (int i = 0; i < n; i++) {
+            cJSON *sensor = cJSON_GetArrayItem(sensores, i);
+            cJSON *tipo = cJSON_GetObjectItem(sensor, "tipo");
+
+            if (cJSON_IsString(tipo) && tipo->valuestring != NULL) {
+                if (strcmp(tipo->valuestring, "temperatura") == 0) {
+                    g_has_temperature = true;
+                    g_has_bme280 = true;
+                } else if (strcmp(tipo->valuestring, "humedad") == 0) {
+                    g_has_humidity = true;
+                    g_has_bme280 = true;
+                } else if (strcmp(tipo->valuestring, "presion") == 0) {
+                    g_has_pressure = true;
+                    g_has_bme280 = true;
+                }
+            }
+        }
+    }
+
+    g_has_config = true;
+
+    ESP_LOGI(TAG, "Config aplicada correctamente");
+    ESP_LOGI(TAG, "tipo_nodo=%s", g_tipo_nodo);
+    ESP_LOGI(TAG, "topic_pub_cfg=%s", g_topic_pub_cfg);
+    ESP_LOGI(TAG, "topic_sub_cfg=%s", g_topic_sub_cfg);
+    ESP_LOGI(TAG, "sensores detectados -> temp=%d hum=%d pres=%d bme280=%d",
+             g_has_temperature, g_has_humidity, g_has_pressure, g_has_bme280);
+
+    cJSON_Delete(root);
+    return true;
+}
+
+/*
+ * request_config_via_mqtt_for_mac:
+ * El root pide por MQTT la configuración de una MAC concreta.
+ */
+static void request_config_via_mqtt_for_mac(const uint8_t mac[6])
+{
+    if (!esp_mesh_is_root()) {
+        return;
+    }
+
+    if (!mqtt_connected) {
+        ESP_LOGW(TAG, "MQTT no conectado, no se puede pedir config");
+        return;
+    }
+
+    char mac_colon[18];
+    char payload[128];
+
+    format_mac_with_colons(mac, mac_colon, sizeof(mac_colon));
+    snprintf(payload, sizeof(payload), "{\"mac\":\"%s\"}", mac_colon);
+
+    enqueue_mqtt_message(MQTT_CONFIG_REQUEST_TOPIC, payload);
+
+    ESP_LOGI(TAG, "Root pide config para MAC %s", mac_colon);
+}
+
+/*
+ * request_config_from_root_over_mesh:
+ * Un nodo no-root pide al root su configuración por mesh.
+ */
+static void request_config_from_root_over_mesh(void)
+{
+    if (esp_mesh_is_root()) {
+        return;
+    }
+
+    if (!is_mesh_connected) {
+        ESP_LOGW(TAG, "Nodo no conectado a mesh");
+        return;
+    }
+
+    mesh_data_t data;
+    char msg[] = MESH_CFG_REQ_MSG;
+
+    data.data = (uint8_t *)msg;
+    data.size = strlen(msg) + 1;
+    data.proto = MESH_PROTO_BIN;
+    data.tos = MESH_TOS_P2P;
+
+    esp_err_t err = esp_mesh_send(NULL, &data, 0, NULL, 0);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "Nodo pidió config al root por mesh");
+    } else {
+        ESP_LOGW(TAG, "Error pidiendo config al root: %s", esp_err_to_name(err));
+    }
+}
+
+/*
+ * forward_config_response_to_mesh_node:
+ * El root reenvía por mesh la configuración recibida desde MQTT.
+ */
+static void forward_config_response_to_mesh_node(const char *mac_suffix, const char *json_payload)
+{
+    if (!esp_mesh_is_root()) {
+        return;
+    }
+
+    mesh_addr_t dest;
+    if (!parse_mac_from_suffix(mac_suffix, &dest)) {
+        ESP_LOGW(TAG, "MAC inválida en respuesta config: %s", mac_suffix);
+        return;
+    }
+
+    char msg[MQTT_MSG_MAX_LEN];
+    snprintf(msg, sizeof(msg), "%s%s", MESH_CFG_RSP_PREFIX, json_payload);
+
+    mesh_data_t data;
+    data.data = (uint8_t *)msg;
+    data.size = strlen(msg) + 1;
+    data.proto = MESH_PROTO_BIN;
+    data.tos = MESH_TOS_P2P;
+
+    esp_err_t err = esp_mesh_send(&dest, &data, MESH_DATA_FROMDS, NULL, 0);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "Root reenvió config por mesh a " MACSTR, MAC2STR(dest.addr));
+    } else {
+        ESP_LOGW(TAG, "Error reenviando config por mesh: %s", esp_err_to_name(err));
+    }
+}
+
+/*
  * get_node_id_from_mac_str:
  * Busca una MAC en node_labels.h.
- * Si existe, devuelve el identificador fácil.
- * Si no existe, devuelve la propia MAC.
  */
 static const char *get_node_id_from_mac_str(const char *mac_str)
 {
@@ -297,11 +504,7 @@ static void enqueue_mqtt_message(const char *topic, const char *payload)
 
 /*
  * split_bme280_payload_to_topics:
- * Separa el JSON del BME280 en topics diferentes:
- *
- * mesh/data/<node_id>/temperature
- * mesh/data/<node_id>/pressure
- * mesh/data/<node_id>/humidity
+ * Separa el JSON del BME280 en topics diferentes.
  */
 static bool split_bme280_payload_to_topics(const mesh_addr_t *from, const char *payload)
 {
@@ -389,10 +592,7 @@ static bool parse_mac_from_suffix(const char *suffix, mesh_addr_t *addr)
 
 /*
  * forward_mqtt_command_to_mesh_topic:
- * Recibe un topic tipo mesh/cmd/<mac> y un payload tipo RELAY_ON.
- * Extrae la MAC y reenvía la orden por mesh a ese nodo.
- *
- * Si el destino es el propio root, ejecuta la orden localmente.
+ * Reenvía comandos MQTT por mesh.
  */
 static void forward_mqtt_command_to_mesh_topic(const char *topic, const char *payload)
 {
@@ -429,10 +629,6 @@ static void forward_mqtt_command_to_mesh_topic(const char *topic, const char *pa
              MAC2STR(sta_mac),
              MAC2STR(ap_mac));
 
-    /*
-     * Si el comando va dirigido al propio root, se ejecuta localmente.
-     * Esto contempla tanto la MAC STA como la MAC AP.
-     */
     if (memcmp(dest.addr, sta_mac, 6) == 0 ||
         memcmp(dest.addr, ap_mac, 6) == 0) {
 
@@ -500,8 +696,9 @@ static void start_mesh_tasks_once(void)
     BaseType_t ok2 = xTaskCreate(tx_task, "tx_task", 8192, NULL, 5, NULL);
     BaseType_t ok3 = xTaskCreate(mqtt_task, "mqtt_task", 8192, NULL, 5, NULL);
     BaseType_t ok4 = xTaskCreate(sensor_relay_task, "sensor_relay_task", 8192, NULL, 5, NULL);
-    
-    if (ok1 != pdPASS || ok2 != pdPASS || ok3 != pdPASS || ok4 != pdPASS) {
+    BaseType_t ok5 = xTaskCreate(config_request_task, "config_request_task", 4096, NULL, 5, NULL);
+
+    if (ok1 != pdPASS || ok2 != pdPASS || ok3 != pdPASS || ok4 != pdPASS || ok5 != pdPASS) {
         ESP_LOGE(TAG, "No se pudieron crear todas las tareas");
         return;
     }
@@ -528,8 +725,17 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
             ESP_LOGI(TAG, "MQTT conectado");
 
             if (esp_mesh_is_root()) {
-                int msg_id = esp_mqtt_client_subscribe(mqtt_client, MQTT_CMD_BASE_TOPIC "/#", 1);
-                ESP_LOGI(TAG, "Suscrito a topic %s/#, msg_id=%d", MQTT_CMD_BASE_TOPIC, msg_id);
+                int cmd_id = esp_mqtt_client_subscribe(mqtt_client, MQTT_CMD_BASE_TOPIC "/#", 1);
+                ESP_LOGI(TAG, "Suscrito a topic %s/#, msg_id=%d", MQTT_CMD_BASE_TOPIC, cmd_id);
+
+                int cfg_id = esp_mqtt_client_subscribe(mqtt_client, MQTT_CONFIG_BASE_TOPIC "/#", 1);
+                ESP_LOGI(TAG, "Suscrito a topic %s/#, msg_id=%d", MQTT_CONFIG_BASE_TOPIC, cfg_id);
+
+                {
+                    uint8_t mac[6];
+                    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+                    request_config_via_mqtt_for_mac(mac);
+                }
             }
             break;
 
@@ -564,6 +770,24 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
             payload[data_len] = '\0';
 
             ESP_LOGI(TAG, "MQTT DATA topic=%s payload=%s", topic, payload);
+
+            if (strcmp(topic, MQTT_CONFIG_REQUEST_TOPIC) == 0) {
+                break;
+            }
+
+            if (strncmp(topic, MQTT_CONFIG_BASE_TOPIC "/", strlen(MQTT_CONFIG_BASE_TOPIC "/")) == 0) {
+                const char *suffix = topic + strlen(MQTT_CONFIG_BASE_TOPIC "/");
+
+                if (strcmp(suffix, g_mac_no_colons) == 0) {
+                    ESP_LOGI(TAG, "Configuración propia recibida en %s: %s", topic, payload);
+                    if (apply_node_config(payload)) {
+                        g_config_received = true;
+                    }
+                } else if (esp_mesh_is_root()) {
+                    forward_config_response_to_mesh_node(suffix, payload);
+                }
+                break;
+            }
 
             if (esp_mesh_is_root()) {
                 forward_mqtt_command_to_mesh_topic(topic, payload);
@@ -627,11 +851,13 @@ static void mesh_event_handler(void *arg, esp_event_base_t event_base,
                 ESP_LOGI(TAG, "Conectado a mesh (%s), layer=%d",
                          esp_mesh_is_root() ? "ROOT" : "NODE",
                          esp_mesh_get_layer());
-		mesh_addr_t parent_addr;
-		esp_mesh_get_parent_bssid(&parent_addr);
 
-		ESP_LOGI(TAG, "Parent BSSID: " MACSTR, MAC2STR(parent_addr.addr));
-		
+                {
+                    mesh_addr_t parent_addr;
+                    esp_mesh_get_parent_bssid(&parent_addr);
+                    ESP_LOGI(TAG, "Parent BSSID: " MACSTR, MAC2STR(parent_addr.addr));
+                }
+
                 if (esp_mesh_is_root() && netif_sta != NULL) {
                     esp_err_t err;
 
@@ -689,19 +915,28 @@ static void mesh_event_handler(void *arg, esp_event_base_t event_base,
 
 /*
  * sensor_relay_task:
- * Lee el BME280 y actualiza el estado global.
- * El relé NO depende de la temperatura.
- * El relé solo cambia cuando llega RELAY_ON o RELAY_OFF.
+ * Inicializa sensor solo si la configuración dice que existe BME280.
  */
 static void sensor_relay_task(void *arg)
 {
     (void)arg;
 
-    esp_err_t err = sensor_init_once();
     relay_init();
 
+    while (!g_config_received || !g_has_config) {
+        ESP_LOGI(TAG, "Esperando configuración del nodo...");
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+
+    if (!g_has_bme280) {
+        ESP_LOGI(TAG, "Este nodo no tiene BME280 según la configuración. No se inicia tarea de sensor.");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    esp_err_t err = sensor_init_once();
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "Este nodo no tiene BME280. Seguira en mesh sin sensor.");
+        ESP_LOGW(TAG, "La configuración indica BME280, pero no se ha detectado físicamente.");
         vTaskDelete(NULL);
         return;
     }
@@ -737,7 +972,6 @@ static void sensor_relay_task(void *arg)
 
             if (sensor_mutex != NULL &&
                 xSemaphoreTake(sensor_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-
                 g_sensor_data.temperature = temperature;
                 g_sensor_data.pressure_hpa = pressure_hpa;
                 g_sensor_data.humidity = humidity;
@@ -767,12 +1001,6 @@ static void sensor_relay_task(void *arg)
 /*
  * rx_task:
  * Espera mensajes que llegan por la mesh.
- *
- * Si este nodo es root:
- * - separa mensajes BME280 en topics diferentes.
- *
- * Si este nodo NO es root:
- * - interpreta comandos tipo RELAY_ON / RELAY_OFF.
  */
 static void rx_task(void *arg)
 {
@@ -809,10 +1037,13 @@ static void rx_task(void *arg)
                      MAC2STR(from.addr), (char *)data.data);
 
             if (esp_mesh_is_root()) {
-                /*
-                 * Si el root recibe por mesh un comando de control,
-                 * no lo publica como dato.
-                 */
+                if (strcmp((char *)data.data, MESH_CFG_REQ_MSG) == 0) {
+                    ESP_LOGI(TAG, "Root recibió petición de config desde " MACSTR,
+                             MAC2STR(from.addr));
+                    request_config_via_mqtt_for_mac(from.addr);
+                    continue;
+                }
+
                 if (strcmp((char *)data.data, "RELAY_ON") == 0 ||
                     strcmp((char *)data.data, "RELAY_OFF") == 0) {
                     ESP_LOGI(TAG, "Root recibió comando de control desde mesh, no se publica como dato: %s",
@@ -820,15 +1051,9 @@ static void rx_task(void *arg)
                     continue;
                 }
 
-                /*
-                 * Si el mensaje es un JSON del BME280, se separa por medición.
-                 */
                 bool separated = split_bme280_payload_to_topics(&from, (char *)data.data);
 
                 if (!separated) {
-                    /*
-                     * Fallback: si no se puede separar, se publica en raw usando etiqueta.
-                     */
                     char mac_str[32];
                     const char *node_id;
                     char topic[MQTT_TOPIC_MAX_LEN];
@@ -837,10 +1062,19 @@ static void rx_task(void *arg)
                     node_id = get_node_id_from_mac_str(mac_str);
 
                     snprintf(topic, sizeof(topic), "%s/%s/raw", MQTT_DATA_BASE_TOPIC, node_id);
-
                     enqueue_mqtt_message(topic, (char *)data.data);
                 }
             } else {
+                if (strncmp((char *)data.data, MESH_CFG_RSP_PREFIX, strlen(MESH_CFG_RSP_PREFIX)) == 0) {
+                    const char *json_cfg = (char *)data.data + strlen(MESH_CFG_RSP_PREFIX);
+                    ESP_LOGI(TAG, "Configuración recibida por mesh: %s", json_cfg);
+
+                    if (apply_node_config(json_cfg)) {
+                        g_config_received = true;
+                    }
+                    continue;
+                }
+
                 process_mesh_command((char *)data.data);
             }
         }
@@ -850,10 +1084,6 @@ static void rx_task(void *arg)
 /*
  * tx_task:
  * Envía mensajes por la mesh.
- *
- * - solo los nodos NO root envían.
- * - envían hacia arriba con esp_mesh_send(NULL, ...).
- * - se envía el último snapshot del BME280.
  */
 static void tx_task(void *arg)
 {
@@ -916,6 +1146,7 @@ static void tx_task(void *arg)
         vTaskDelay(pdMS_TO_TICKS(TX_INTERVAL_MS));
     }
 }
+
 /*
  * mqtt_task:
  * Espera mensajes en la cola y los publica en el broker MQTT.
@@ -964,6 +1195,33 @@ static void mqtt_task(void *arg)
                 ESP_LOGW(TAG, "No se pudo publicar en MQTT");
             }
         }
+    }
+}
+
+/*
+ * config_request_task:
+ * Reintenta pedir la configuración hasta recibirla.
+ */
+static void config_request_task(void *arg)
+{
+    (void)arg;
+
+    ESP_LOGI(TAG, "config_request_task arrancada");
+
+    while (1) {
+        if (!g_config_received) {
+            if (esp_mesh_is_root()) {
+                uint8_t mac[6];
+                esp_read_mac(mac, ESP_MAC_WIFI_STA);
+                ESP_LOGI(TAG, "Root va a pedir su config");
+                request_config_via_mqtt_for_mac(mac);
+            } else {
+                ESP_LOGI(TAG, "Nodo no root va a pedir config al root");
+                request_config_from_root_over_mesh();
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(CONFIG_RETRY_MS));
     }
 }
 
@@ -1057,7 +1315,16 @@ void app_main(void)
 
     uint8_t mac[6];
     esp_read_mac(mac, ESP_MAC_WIFI_STA);
-    ESP_LOGI(TAG, "Mi MAC es: " MACSTR, MAC2STR(mac));
+
+    format_mac_with_colons(mac, g_mac_colon, sizeof(g_mac_colon));
+    format_mac_no_colons(mac, g_mac_no_colons, sizeof(g_mac_no_colons));
+
+    snprintf(g_config_topic, sizeof(g_config_topic), "%s/%s",
+             MQTT_CONFIG_BASE_TOPIC, g_mac_no_colons);
+
+    ESP_LOGI(TAG, "Mi MAC con dos puntos: %s", g_mac_colon);
+    ESP_LOGI(TAG, "Mi MAC sin dos puntos: %s", g_mac_no_colons);
+    ESP_LOGI(TAG, "Topic de config: %s", g_config_topic);
 
     mesh_init();
 }
