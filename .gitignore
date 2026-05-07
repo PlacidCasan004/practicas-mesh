@@ -6,3 +6,27 @@ dependencies.lock
 *.pyc
 __pycache__/
 .vscode/
+
+# Archivos generados / pruebas
+cam_log.txt
+captura_camara.jpg
+*.jpg
+*.jpeg
+*.png
+*.log
+*.bak*
+
+# IA / entrenamiento / datasets
+docker-iot/datasets/
+docker-iot/yolo/
+ia-barcos/
+modelos_barcos/
+**/runs/
+**/*.pt
+**/*.onnx
+**/*.engine
+**/*.weights
+**/*.tflite
+
+# Si solo quieres dejar el .h entrenado
+!main/barcos_model_data.h

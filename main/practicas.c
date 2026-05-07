@@ -60,7 +60,7 @@
 #define BME280_I2C_ADDRESS     0x76
 
 /* Relé */
-#define RELAY_PIN              GPIO_NUM_23
+#define RELAY_PIN              GPIO_NUM_1
 #define RELAY_ACTIVE_LOW       1
 
 typedef struct {
@@ -116,6 +116,9 @@ static char g_topic_pub_cfg[MQTT_TOPIC_MAX_LEN] = {0};
 static char g_topic_sub_cfg[MQTT_TOPIC_MAX_LEN] = {0};
 
 /* Prototipos */
+void test_barcos_model_load(void);
+
+
 static void rx_task(void *arg);
 static void tx_task(void *arg);
 static void mqtt_task(void *arg);
@@ -1312,6 +1315,8 @@ void app_main(void)
         err = nvs_flash_init();
     }
     ESP_ERROR_CHECK(err);
+    
+    test_barcos_model_load();
 
     uint8_t mac[6];
     esp_read_mac(mac, ESP_MAC_WIFI_STA);
