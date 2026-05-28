@@ -3,6 +3,7 @@
 #include <string.h>
 #include <math.h>
 
+#include "esp_err.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
@@ -23,24 +24,47 @@ static const char *TAG_MODEL = "BARCOS_MODEL";
 
 #define TENSOR_ARENA_SIZE (4 * 1024 * 1024)
 
-/* Pines cámara XIAO ESP32-S3 Sense */
+/*
+ * Pines cámara GOOUUU ESP32-S3-CAM
+ *
+ * Sustituye a los pines antiguos de la XIAO ESP32-S3 Sense.
+ *
+ * Mapeo cámara:
+ * Y2  -> GPIO11
+ * Y3  -> GPIO9
+ * Y4  -> GPIO8
+ * Y5  -> GPIO10
+ * Y6  -> GPIO12
+ * Y7  -> GPIO18
+ * Y8  -> GPIO17
+ * Y9  -> GPIO16
+ *
+ * XCLK  -> GPIO15
+ * SIOD  -> GPIO4
+ * SIOC  -> GPIO5
+ * VSYNC -> GPIO6
+ * HREF  -> GPIO7
+ * PCLK  -> GPIO13
+ */
+
 #define PWDN_GPIO_NUM     -1
 #define RESET_GPIO_NUM    -1
-#define XCLK_GPIO_NUM     10
-#define SIOD_GPIO_NUM     40
-#define SIOC_GPIO_NUM     39
 
-#define Y9_GPIO_NUM       48
-#define Y8_GPIO_NUM       11
-#define Y7_GPIO_NUM       12
-#define Y6_GPIO_NUM       14
-#define Y5_GPIO_NUM       16
-#define Y4_GPIO_NUM       18
-#define Y3_GPIO_NUM       17
-#define Y2_GPIO_NUM       15
+#define XCLK_GPIO_NUM     15
+#define SIOD_GPIO_NUM     4
+#define SIOC_GPIO_NUM     5
 
-#define VSYNC_GPIO_NUM    38
-#define HREF_GPIO_NUM     47
+#define Y9_GPIO_NUM       16
+#define Y8_GPIO_NUM       17
+#define Y7_GPIO_NUM       18
+#define Y6_GPIO_NUM       12
+#define Y5_GPIO_NUM       10
+#define Y4_GPIO_NUM       8
+#define Y3_GPIO_NUM       9
+#define Y2_GPIO_NUM       11
+
+#define VSYNC_GPIO_NUM    6
+#define HREF_GPIO_NUM     7
 #define PCLK_GPIO_NUM     13
 
 static uint8_t *tensor_arena = nullptr;
@@ -118,12 +142,34 @@ static esp_err_t camera_init_once(void)
     config.pin_pwdn = PWDN_GPIO_NUM;
     config.pin_reset = RESET_GPIO_NUM;
 
-    config.xclk_freq_hz = 10000000;
+    /*
+     * Para la GOOUUU probamos primero 20 MHz.
+     * Si falla la inicialización de cámara, cambia esto a 10000000.
+     */
+    config.xclk_freq_hz = 20000000;
+
+    /*
+     * Importante:
+     * Mantenemos RGB565 porque tu código convierte de RGB565 a RGB888
+     * para meter la imagen al modelo.
+     */
     config.pixel_format = PIXFORMAT_RGB565;
+
+    /*
+     * Tu modelo espera 160x160.
+     * La cámara captura 160x120 y luego se hace letterbox a 160x160.
+     */
     config.frame_size = FRAMESIZE_QQVGA;   // 160x120
+
     config.jpeg_quality = 12;
     config.fb_count = 1;
+
+    /*
+     * Para 160x120 RGB565 cabe en DRAM.
+     * Dejamos la imagen en DRAM y reservamos la PSRAM para TensorFlow Lite.
+     */
     config.fb_location = CAMERA_FB_IN_DRAM;
+
     config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
 
     esp_camera_deinit();
@@ -132,12 +178,24 @@ static esp_err_t camera_init_once(void)
     esp_err_t err = ESP_FAIL;
 
     for (int intento = 1; intento <= 5; intento++) {
-        ESP_LOGI(TAG_MODEL, "Inicializando cámara, intento %d/5...", intento);
+        ESP_LOGI(TAG_MODEL, "Inicializando cámara GOOUUU, intento %d/5...", intento);
 
         err = esp_camera_init(&config);
 
         if (err == ESP_OK) {
             ESP_LOGI(TAG_MODEL, "Cámara inicializada correctamente");
+
+            sensor_t *sensor = esp_camera_sensor_get();
+            if (sensor != nullptr) {
+                ESP_LOGI(TAG_MODEL, "Sensor detectado PID=0x%02x", sensor->id.PID);
+
+                /*
+                 * Si la imagen sale girada o en espejo, cambia estos valores.
+                 */
+                sensor->set_vflip(sensor, 0);
+                sensor->set_hmirror(sensor, 0);
+            }
+
             return ESP_OK;
         }
 
@@ -235,6 +293,17 @@ static void dump_frame_as_jpeg_base64(camera_fb_t *fb)
         b64_len,
         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
     );
+
+    /*
+     * Si por lo que sea no puede reservar en PSRAM,
+     * intentamos reservar en memoria normal.
+     */
+    if (b64_buf == nullptr) {
+        b64_buf = (uint8_t *)heap_caps_malloc(
+            b64_len,
+            MALLOC_CAP_8BIT
+        );
+    }
 
     if (b64_buf == nullptr) {
         ESP_LOGE(TAG_MODEL, "No se pudo reservar memoria para base64");

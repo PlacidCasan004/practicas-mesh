@@ -17,6 +17,7 @@
 #include "esp_wifi.h"
 #include "esp_netif.h"
 #include "esp_mesh.h"
+#include "esp_heap_caps.h"
 #include "mqtt_client.h"
 #include "driver/gpio.h"
 #include "driver/i2c.h"
@@ -51,6 +52,17 @@
 #define MQTT_QUEUE_LEN         10
 #define MQTT_MSG_MAX_LEN       512
 #define MQTT_TOPIC_MAX_LEN     128
+
+/* Stacks de tareas.
+ * Antes eran bastante altos. Con cámara + TensorFlow Lite + mesh + MQTT,
+ * conviene ahorrar memoria interna para que no fallen las xTaskCreate().
+ */
+#define RX_TASK_STACK              8192
+#define TX_TASK_STACK              4096
+#define MQTT_TASK_STACK            4096
+#define SENSOR_RELAY_TASK_STACK    4096
+#define CONFIG_REQUEST_TASK_STACK  3072
+#define TASK_PRIORITY              5
 
 /* BME280 */
 #define I2C_MASTER_SCL_IO      22
@@ -115,9 +127,17 @@ static char g_tipo_nodo[32] = {0};
 static char g_topic_pub_cfg[MQTT_TOPIC_MAX_LEN] = {0};
 static char g_topic_sub_cfg[MQTT_TOPIC_MAX_LEN] = {0};
 
+/* Handles de tareas.
+ * Sirven para no crear tareas duplicadas cuando la mesh se desconecta y reconecta.
+ */
+static TaskHandle_t rx_task_handle = NULL;
+static TaskHandle_t tx_task_handle = NULL;
+static TaskHandle_t mqtt_task_handle = NULL;
+static TaskHandle_t sensor_relay_task_handle = NULL;
+static TaskHandle_t config_request_task_handle = NULL;
+
 /* Prototipos */
 void test_barcos_model_load(void);
-
 
 static void rx_task(void *arg);
 static void tx_task(void *arg);
@@ -126,6 +146,11 @@ static void sensor_relay_task(void *arg);
 static void config_request_task(void *arg);
 
 static void start_mesh_tasks_once(void);
+static bool create_task_if_needed(TaskHandle_t *handle,
+                                  TaskFunction_t function,
+                                  const char *name,
+                                  uint32_t stack_depth);
+static void log_memory_status(const char *label);
 static void mqtt_app_start(void);
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
                                int32_t event_id, void *event_data);
@@ -155,6 +180,52 @@ static bool split_bme280_payload_to_topics(const mesh_addr_t *from, const char *
 
 static void reset_node_capabilities(void);
 static bool apply_node_config(const char *json_cfg);
+
+/*
+ * log_memory_status:
+ * Imprime memoria libre para diagnosticar fallos de creación de tareas.
+ */
+static void log_memory_status(const char *label)
+{
+    ESP_LOGI(TAG, "%s | heap interno libre=%u bytes | PSRAM libre=%u bytes",
+             label,
+             (unsigned int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned int)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+}
+
+/*
+ * create_task_if_needed:
+ * Crea una tarea solo si su handle está vacío.
+ */
+static bool create_task_if_needed(TaskHandle_t *handle,
+                                  TaskFunction_t function,
+                                  const char *name,
+                                  uint32_t stack_depth)
+{
+    if (*handle != NULL) {
+        ESP_LOGW(TAG, "%s ya estaba creada, no se crea otra vez", name);
+        return true;
+    }
+
+    BaseType_t ok = xTaskCreate(
+        function,
+        name,
+        stack_depth,
+        NULL,
+        TASK_PRIORITY,
+        handle
+    );
+
+    if (ok != pdPASS) {
+        ESP_LOGE(TAG, "No se pudo crear %s", name);
+        log_memory_status("Memoria al fallar xTaskCreate");
+        *handle = NULL;
+        return false;
+    }
+
+    ESP_LOGI(TAG, "%s creada correctamente con stack=%lu", name, (unsigned long)stack_depth);
+    return true;
+}
 
 /*
  * relay_init:
@@ -662,52 +733,78 @@ static void forward_mqtt_command_to_mesh_topic(const char *topic, const char *pa
 /*
  * start_mesh_tasks_once:
  * Arranca las tareas solo una vez.
+ * Si la mesh se reconecta, no duplica tareas.
+ * Si alguna falla por memoria, se indica cuál falla.
  */
 static void start_mesh_tasks_once(void)
 {
-    static bool started = false;
+    bool all_ok = true;
 
-    if (started) {
-        return;
-    }
+    log_memory_status("Antes de crear recursos/tareas mesh");
 
     if (mqtt_queue == NULL) {
         mqtt_queue = xQueueCreate(MQTT_QUEUE_LEN, sizeof(mqtt_publish_item_t));
         if (mqtt_queue == NULL) {
             ESP_LOGE(TAG, "No se pudo crear la cola MQTT");
+            log_memory_status("Memoria al fallar cola MQTT");
             return;
         }
+        ESP_LOGI(TAG, "Cola MQTT creada");
     }
 
     if (sensor_mutex == NULL) {
         sensor_mutex = xSemaphoreCreateMutex();
         if (sensor_mutex == NULL) {
             ESP_LOGE(TAG, "No se pudo crear el mutex del sensor");
+            log_memory_status("Memoria al fallar mutex sensor");
             return;
         }
+        ESP_LOGI(TAG, "Mutex sensor creado");
     }
 
     if (relay_mutex == NULL) {
         relay_mutex = xSemaphoreCreateMutex();
         if (relay_mutex == NULL) {
             ESP_LOGE(TAG, "No se pudo crear el mutex del rele");
+            log_memory_status("Memoria al fallar mutex rele");
             return;
         }
+        ESP_LOGI(TAG, "Mutex rele creado");
     }
 
-    BaseType_t ok1 = xTaskCreate(rx_task, "rx_task", 12288, NULL, 5, NULL);
-    BaseType_t ok2 = xTaskCreate(tx_task, "tx_task", 8192, NULL, 5, NULL);
-    BaseType_t ok3 = xTaskCreate(mqtt_task, "mqtt_task", 8192, NULL, 5, NULL);
-    BaseType_t ok4 = xTaskCreate(sensor_relay_task, "sensor_relay_task", 8192, NULL, 5, NULL);
-    BaseType_t ok5 = xTaskCreate(config_request_task, "config_request_task", 4096, NULL, 5, NULL);
+    all_ok &= create_task_if_needed(&rx_task_handle,
+                                    rx_task,
+                                    "rx_task",
+                                    RX_TASK_STACK);
 
-    if (ok1 != pdPASS || ok2 != pdPASS || ok3 != pdPASS || ok4 != pdPASS || ok5 != pdPASS) {
+    all_ok &= create_task_if_needed(&tx_task_handle,
+                                    tx_task,
+                                    "tx_task",
+                                    TX_TASK_STACK);
+
+    all_ok &= create_task_if_needed(&mqtt_task_handle,
+                                    mqtt_task,
+                                    "mqtt_task",
+                                    MQTT_TASK_STACK);
+
+    all_ok &= create_task_if_needed(&sensor_relay_task_handle,
+                                    sensor_relay_task,
+                                    "sensor_relay_task",
+                                    SENSOR_RELAY_TASK_STACK);
+
+    all_ok &= create_task_if_needed(&config_request_task_handle,
+                                    config_request_task,
+                                    "config_request_task",
+                                    CONFIG_REQUEST_TASK_STACK);
+
+    log_memory_status("Despues de crear recursos/tareas mesh");
+
+    if (!all_ok) {
         ESP_LOGE(TAG, "No se pudieron crear todas las tareas");
         return;
     }
 
-    started = true;
-    ESP_LOGI(TAG, "Tareas creadas correctamente");
+    ESP_LOGI(TAG, "Tareas mesh listas");
 }
 
 /*
@@ -734,11 +831,9 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
                 int cfg_id = esp_mqtt_client_subscribe(mqtt_client, MQTT_CONFIG_BASE_TOPIC "/#", 1);
                 ESP_LOGI(TAG, "Suscrito a topic %s/#, msg_id=%d", MQTT_CONFIG_BASE_TOPIC, cfg_id);
 
-                {
-                    uint8_t mac[6];
-                    esp_read_mac(mac, ESP_MAC_WIFI_STA);
-                    request_config_via_mqtt_for_mac(mac);
-                }
+                uint8_t mac[6];
+                esp_read_mac(mac, ESP_MAC_WIFI_STA);
+                request_config_via_mqtt_for_mac(mac);
             }
             break;
 
@@ -882,6 +977,7 @@ static void mesh_event_handler(void *arg, esp_event_base_t event_base,
 
             case MESH_EVENT_PARENT_DISCONNECTED:
                 is_mesh_connected = false;
+                mqtt_connected = false;
                 ESP_LOGW(TAG, "Desconectado de mesh");
                 break;
 
@@ -927,12 +1023,12 @@ static void sensor_relay_task(void *arg)
     relay_init();
 
     while (!g_config_received || !g_has_config) {
-        ESP_LOGI(TAG, "Esperando configuración del nodo...");
+        ESP_LOGI(TAG, "Esperando configuración del nodo antes de iniciar sensor...");
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 
     if (!g_has_bme280) {
-        ESP_LOGI(TAG, "Este nodo no tiene BME280 según la configuración. No se inicia tarea de sensor.");
+        ESP_LOGI(TAG, "Este nodo no tiene BME280 según la configuración. sensor_relay_task termina.");
         vTaskDelete(NULL);
         return;
     }
@@ -1153,6 +1249,7 @@ static void tx_task(void *arg)
 /*
  * mqtt_task:
  * Espera mensajes en la cola y los publica en el broker MQTT.
+ * Cambio importante: si MQTT no está conectado, NO consume la cola.
  */
 static void mqtt_task(void *arg)
 {
@@ -1161,27 +1258,22 @@ static void mqtt_task(void *arg)
     mqtt_publish_item_t item;
 
     while (1) {
+        if (!esp_mesh_is_root()) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
         if (mqtt_queue == NULL) {
             vTaskDelay(pdMS_TO_TICKS(500));
             continue;
         }
 
-        if (xQueueReceive(mqtt_queue, &item, portMAX_DELAY) == pdTRUE) {
-            if (!esp_mesh_is_root()) {
-                ESP_LOGW(TAG, "mqtt_task activa en un nodo no-root, mensaje ignorado");
-                continue;
-            }
+        if (mqtt_client == NULL || !mqtt_connected) {
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
+        }
 
-            if (mqtt_client == NULL) {
-                ESP_LOGW(TAG, "Cliente MQTT no inicializado");
-                continue;
-            }
-
-            if (!mqtt_connected) {
-                ESP_LOGW(TAG, "MQTT no conectado, no se publica");
-                continue;
-            }
-
+        if (xQueueReceive(mqtt_queue, &item, pdMS_TO_TICKS(1000)) == pdTRUE) {
             int msg_id = esp_mqtt_client_publish(
                 mqtt_client,
                 item.topic,
@@ -1195,7 +1287,9 @@ static void mqtt_task(void *arg)
                 ESP_LOGI(TAG, "Publicado en MQTT topic %s, msg_id=%d, msg=%s",
                          item.topic, msg_id, item.payload);
             } else {
-                ESP_LOGW(TAG, "No se pudo publicar en MQTT");
+                ESP_LOGW(TAG, "No se pudo publicar en MQTT, reintentando luego");
+                (void)xQueueSendToFront(mqtt_queue, &item, 0);
+                vTaskDelay(pdMS_TO_TICKS(1000));
             }
         }
     }
@@ -1204,6 +1298,7 @@ static void mqtt_task(void *arg)
 /*
  * config_request_task:
  * Reintenta pedir la configuración hasta recibirla.
+ * Cambio importante: el root espera a que MQTT esté conectado antes de pedir config.
  */
 static void config_request_task(void *arg)
 {
@@ -1212,12 +1307,23 @@ static void config_request_task(void *arg)
     ESP_LOGI(TAG, "config_request_task arrancada");
 
     while (1) {
-        if (!g_config_received) {
-            if (esp_mesh_is_root()) {
+        if (g_config_received) {
+            vTaskDelay(pdMS_TO_TICKS(CONFIG_RETRY_MS));
+            continue;
+        }
+
+        if (esp_mesh_is_root()) {
+            if (!mqtt_connected) {
+                ESP_LOGW(TAG, "Root espera a MQTT antes de pedir config");
+            } else {
                 uint8_t mac[6];
                 esp_read_mac(mac, ESP_MAC_WIFI_STA);
                 ESP_LOGI(TAG, "Root va a pedir su config");
                 request_config_via_mqtt_for_mac(mac);
+            }
+        } else {
+            if (!is_mesh_connected) {
+                ESP_LOGW(TAG, "Nodo no-root espera conexión mesh antes de pedir config");
             } else {
                 ESP_LOGI(TAG, "Nodo no root va a pedir config al root");
                 request_config_from_root_over_mesh();
@@ -1315,8 +1421,12 @@ void app_main(void)
         err = nvs_flash_init();
     }
     ESP_ERROR_CHECK(err);
-    
+
+    log_memory_status("Inicio app_main");
+
     test_barcos_model_load();
+
+    log_memory_status("Despues de test_barcos_model_load");
 
     uint8_t mac[6];
     esp_read_mac(mac, ESP_MAC_WIFI_STA);
