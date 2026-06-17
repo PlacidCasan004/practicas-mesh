@@ -18,6 +18,7 @@
 #include "esp_netif.h"
 #include "esp_mesh.h"
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
 #include "mqtt_client.h"
 #include "driver/gpio.h"
 #include "driver/i2c.h"
@@ -35,7 +36,7 @@
 #define ROUTER_PASS            "tequieromuchocartucho"
 #define ROUTER_CHANNEL         2
 
-#define MQTT_BROKER_URI        "mqtt://192.168.1.101"
+#define MQTT_BROKER_URI        "mqtt://192.168.1.222"
 
 /* Topics MQTT */
 #define MQTT_DATA_BASE_TOPIC       "mesh/data"
@@ -62,7 +63,15 @@
 #define MQTT_TASK_STACK            4096
 #define SENSOR_RELAY_TASK_STACK    4096
 #define CONFIG_REQUEST_TASK_STACK  3072
+#define CAMERA_TASK_STACK          8192
 #define TASK_PRIORITY              5
+
+/* Comandos de cámara */
+#define CAMERA_CMD_QUEUE_LEN       4
+#define CAMERA_CMD_MAX_LEN         64
+#define CAMERA_CMD_CAPTURE         "CAMERA_CAPTURE"
+#define CAMERA_CMD_BOAT_PRESENCE   "BOAT_PRESENCE"
+#define CAMERA_RESULT_SUFFIX       "detection"
 
 /* BME280 */
 #define I2C_MASTER_SCL_IO      22
@@ -92,7 +101,13 @@ typedef struct {
     char payload[MQTT_MSG_MAX_LEN];
 } sensor_snapshot_t;
 
+typedef struct {
+    char command[CAMERA_CMD_MAX_LEN];
+    int64_t timestamp_us;
+} camera_command_item_t;
+
 static QueueHandle_t mqtt_queue = NULL;
+static QueueHandle_t camera_cmd_queue = NULL;
 static SemaphoreHandle_t sensor_mutex = NULL;
 static SemaphoreHandle_t relay_mutex = NULL;
 
@@ -135,15 +150,25 @@ static TaskHandle_t tx_task_handle = NULL;
 static TaskHandle_t mqtt_task_handle = NULL;
 static TaskHandle_t sensor_relay_task_handle = NULL;
 static TaskHandle_t config_request_task_handle = NULL;
+static TaskHandle_t camera_task_handle = NULL;
 
 /* Prototipos */
+typedef struct {
+    bool ok;
+    bool detected;
+    char class_name[24];
+    float score;
+} barcos_detection_result_t;
+
 void test_barcos_model_load(void);
+bool barcos_model_get_last_detection(barcos_detection_result_t *out);
 
 static void rx_task(void *arg);
 static void tx_task(void *arg);
 static void mqtt_task(void *arg);
 static void sensor_relay_task(void *arg);
 static void config_request_task(void *arg);
+static void camera_task(void *arg);
 
 static void start_mesh_tasks_once(void);
 static bool create_task_if_needed(TaskHandle_t *handle,
@@ -161,6 +186,9 @@ static void mesh_init(void);
 static void relay_init(void);
 static void relay_set(bool on);
 static void process_mesh_command(const char *cmd);
+static bool is_camera_command(const char *cmd);
+static void enqueue_camera_command(const char *cmd);
+static void publish_camera_status(const char *cmd, const char *status);
 
 static void i2c_master_init_once(void);
 static esp_err_t sensor_init_once(void);
@@ -177,6 +205,8 @@ static void forward_config_response_to_mesh_node(const char *mac_suffix, const c
 static const char *get_node_id_from_mac_str(const char *mac_str);
 static void enqueue_mqtt_message(const char *topic, const char *payload);
 static bool split_bme280_payload_to_topics(const mesh_addr_t *from, const char *payload);
+static bool is_camera_payload(const char *payload);
+static void publish_camera_mesh_payload_to_mqtt(const mesh_addr_t *from, const char *payload);
 
 static void reset_node_capabilities(void);
 static bool apply_node_config(const char *json_cfg);
@@ -225,6 +255,94 @@ static bool create_task_if_needed(TaskHandle_t *handle,
 
     ESP_LOGI(TAG, "%s creada correctamente con stack=%lu", name, (unsigned long)stack_depth);
     return true;
+}
+
+/*
+ * is_camera_command:
+ * Indica si el payload recibido es un comando para disparar la cámara.
+ */
+static bool is_camera_command(const char *cmd)
+{
+    if (cmd == NULL) {
+        return false;
+    }
+
+    return (strcmp(cmd, CAMERA_CMD_CAPTURE) == 0 ||
+            strcmp(cmd, CAMERA_CMD_BOAT_PRESENCE) == 0);
+}
+
+/*
+ * enqueue_camera_command:
+ * Mete un comando de cámara en una cola para que lo procese camera_task.
+ * Así no se bloquea el callback MQTT ni la recepción mesh ejecutando la IA directamente.
+ */
+static void enqueue_camera_command(const char *cmd)
+{
+    if (camera_cmd_queue == NULL) {
+        ESP_LOGW(TAG, "Cola de cámara no inicializada");
+        return;
+    }
+
+    camera_command_item_t item = {0};
+
+    snprintf(item.command, sizeof(item.command), "%s", cmd);
+    item.timestamp_us = esp_timer_get_time();
+
+    if (xQueueSend(camera_cmd_queue, &item, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "Cola de cámara llena, comando descartado: %s", cmd);
+        publish_camera_status(cmd, "discarded_camera_queue_full");
+        return;
+    }
+
+    ESP_LOGI(TAG, "Comando de cámara encolado: %s", cmd);
+}
+
+/*
+ * publish_camera_status:
+ * Publica un estado sencillo del nodo cámara.
+ * La clase/score los sigue imprimiendo test_barcos_model_load() por consola.
+ */
+static void publish_camera_status(const char *cmd, const char *status)
+{
+    char payload[MQTT_MSG_MAX_LEN];
+    char topic[MQTT_TOPIC_MAX_LEN];
+
+    snprintf(payload, sizeof(payload),
+             "{\"node\":\"%s\",\"type\":\"camera\",\"command\":\"%s\",\"status\":\"%s\",\"layer\":%d}",
+             g_mac_no_colons,
+             cmd != NULL ? cmd : "UNKNOWN",
+             status != NULL ? status : "unknown",
+             esp_mesh_get_layer());
+
+    if (esp_mesh_is_root()) {
+             snprintf(topic, sizeof(topic), "%s/%s/%s",
+             MQTT_DATA_BASE_TOPIC,
+             g_mac_no_colons,
+             CAMERA_RESULT_SUFFIX);
+
+        enqueue_mqtt_message(topic, payload);
+        return;
+    }
+
+    if (!is_mesh_connected) {
+        ESP_LOGW(TAG, "No se puede publicar estado cámara: nodo no conectado a mesh");
+        return;
+    }
+
+    mesh_data_t data;
+
+    data.data = (uint8_t *)payload;
+    data.size = strlen(payload) + 1;
+    data.proto = MESH_PROTO_BIN;
+    data.tos = MESH_TOS_P2P;
+
+    esp_err_t err = esp_mesh_send(NULL, &data, 0, NULL, 0);
+
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "Estado de cámara enviado por mesh: %s", payload);
+    } else {
+        ESP_LOGW(TAG, "Error enviando estado de cámara por mesh: %s", esp_err_to_name(err));
+    }
 }
 
 /*
@@ -326,6 +444,16 @@ static esp_err_t sensor_init_once(void)
  */
 static void process_mesh_command(const char *cmd)
 {
+    if (cmd == NULL) {
+        return;
+    }
+
+    if (is_camera_command(cmd)) {
+        ESP_LOGI(TAG, "Comando de cámara recibido por MQTT/mesh: %s", cmd);
+        enqueue_camera_command(cmd);
+        return;
+    }
+
     if (relay_mutex != NULL &&
         xSemaphoreTake(relay_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
 
@@ -634,6 +762,64 @@ static bool split_bme280_payload_to_topics(const mesh_addr_t *from, const char *
 }
 
 /*
+ * is_camera_payload:
+ * Detecta si un JSON recibido por mesh corresponde a un mensaje de cámara.
+ */
+static bool is_camera_payload(const char *payload)
+{
+    if (payload == NULL) {
+        return false;
+    }
+
+    return (strstr(payload, "\"type\":\"camera\"") != NULL ||
+            strstr(payload, "\"type\": \"camera\"") != NULL);
+}
+
+/*
+ * publish_camera_mesh_payload_to_mqtt:
+ * El root publica en MQTT un mensaje de cámara recibido desde un nodo mesh.
+ * Topic final:
+ *   mesh/data/<MAC>/detection
+ */
+static void publish_camera_mesh_payload_to_mqtt(const mesh_addr_t *from, const char *payload)
+{
+    char mac_str[32];
+    char node_id[32];
+    char topic[MQTT_TOPIC_MAX_LEN];
+
+    node_id[0] = '\0';
+
+    /*
+     * Si el JSON trae "node":"14c19f29e458", usamos ese valor.
+     * Si no, usamos la MAC del emisor mesh.
+     */
+    cJSON *root = cJSON_Parse(payload);
+    if (root != NULL) {
+        cJSON *node = cJSON_GetObjectItem(root, "node");
+        if (cJSON_IsString(node) && node->valuestring != NULL) {
+            snprintf(node_id, sizeof(node_id), "%s", node->valuestring);
+        }
+        cJSON_Delete(root);
+    }
+
+    if (node_id[0] == '\0') {
+        format_mac_no_colons(from->addr, mac_str, sizeof(mac_str));
+        snprintf(node_id, sizeof(node_id), "%s", mac_str);
+    }
+
+    snprintf(topic, sizeof(topic), "%s/%s/%s",
+             MQTT_DATA_BASE_TOPIC,
+             node_id,
+             CAMERA_RESULT_SUFFIX);
+
+    enqueue_mqtt_message(topic, payload);
+
+    ESP_LOGI(TAG, "Payload de cámara recibido por mesh y publicado en MQTT topic %s: %s",
+             topic,
+             payload);
+}
+
+/*
  * parse_mac_from_suffix:
  * Convierte un sufijo tipo "24dcc392cc94" a mesh_addr_t.
  */
@@ -752,6 +938,16 @@ static void start_mesh_tasks_once(void)
         ESP_LOGI(TAG, "Cola MQTT creada");
     }
 
+    if (camera_cmd_queue == NULL) {
+        camera_cmd_queue = xQueueCreate(CAMERA_CMD_QUEUE_LEN, sizeof(camera_command_item_t));
+        if (camera_cmd_queue == NULL) {
+            ESP_LOGE(TAG, "No se pudo crear la cola de cámara");
+            log_memory_status("Memoria al fallar cola cámara");
+            return;
+        }
+        ESP_LOGI(TAG, "Cola de cámara creada");
+    }
+
     if (sensor_mutex == NULL) {
         sensor_mutex = xSemaphoreCreateMutex();
         if (sensor_mutex == NULL) {
@@ -796,6 +992,11 @@ static void start_mesh_tasks_once(void)
                                     config_request_task,
                                     "config_request_task",
                                     CONFIG_REQUEST_TASK_STACK);
+
+    all_ok &= create_task_if_needed(&camera_task_handle,
+                                    camera_task,
+                                    "camera_task",
+                                    CAMERA_TASK_STACK);
 
     log_memory_status("Despues de crear recursos/tareas mesh");
 
@@ -1013,6 +1214,107 @@ static void mesh_event_handler(void *arg, esp_event_base_t event_base,
 }
 
 /*
+ * camera_task:
+ * Espera comandos de cámara y ejecuta la captura/inferencia bajo demanda.
+ */
+static void camera_task(void *arg)
+{
+    (void)arg;
+
+    camera_command_item_t item;
+
+    ESP_LOGI(TAG, "camera_task arrancada");
+
+    while (1) {
+        if (camera_cmd_queue == NULL) {
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
+        }
+
+        if (xQueueReceive(camera_cmd_queue, &item, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+
+        ESP_LOGI(TAG, "camera_task procesa comando: %s", item.command);
+
+        if (!g_config_received || !g_has_config) {
+            ESP_LOGW(TAG, "Comando cámara ignorado: aún no hay configuración del nodo");
+            publish_camera_status(item.command, "ignored_no_config");
+            continue;
+        }
+
+        if (strcmp(g_tipo_nodo, "camara") != 0 &&
+            strcmp(g_tipo_nodo, "camera") != 0) {
+            ESP_LOGW(TAG, "Comando cámara ignorado: este nodo no es tipo camara, tipo_nodo=%s",
+                     g_tipo_nodo);
+            publish_camera_status(item.command, "ignored_not_camera_node");
+            continue;
+        }
+
+        publish_camera_status(item.command, "capture_started");
+        log_memory_status("Antes de ejecutar cámara/IA por comando");
+
+        /*
+         * Esta función ya inicializa cámara/modelo, captura y ejecuta inferencia.
+         * Para versión final conviene separar inicialización y captura para no
+         * reinicializar todo cada vez.
+         */
+        test_barcos_model_load();
+
+        barcos_detection_result_t det = {0};
+        bool has_result = barcos_model_get_last_detection(&det);
+
+        log_memory_status("Despues de ejecutar cámara/IA por comando");
+
+        if (has_result) {
+            char payload[MQTT_MSG_MAX_LEN];
+
+            snprintf(payload, sizeof(payload),
+                     "{\"node\":\"%s\",\"type\":\"camera\",\"command\":\"%s\",\"status\":\"capture_inference_done\",\"detected\":%s,\"class\":\"%s\",\"score\":%.3f,\"layer\":%d}",
+                     g_mac_no_colons,
+                     item.command,
+                     det.detected ? "true" : "false",
+                     det.class_name,
+                     det.score,
+                     esp_mesh_get_layer());
+
+            if (esp_mesh_is_root()) {
+                char topic[MQTT_TOPIC_MAX_LEN];
+
+                snprintf(topic, sizeof(topic), "%s/%s/%s",
+                         MQTT_DATA_BASE_TOPIC,
+                         g_mac_no_colons,
+                         CAMERA_RESULT_SUFFIX);
+
+                enqueue_mqtt_message(topic, payload);
+            } else {
+                if (!is_mesh_connected) {
+                    ESP_LOGW(TAG, "No se puede enviar resultado cámara: nodo no conectado a mesh");
+                } else {
+                    mesh_data_t data;
+
+                    data.data = (uint8_t *)payload;
+                    data.size = strlen(payload) + 1;
+                    data.proto = MESH_PROTO_BIN;
+                    data.tos = MESH_TOS_P2P;
+
+                    esp_err_t err = esp_mesh_send(NULL, &data, 0, NULL, 0);
+
+                    if (err == ESP_OK) {
+                        ESP_LOGI(TAG, "Resultado de cámara enviado al root por mesh: %s", payload);
+                    } else {
+                        ESP_LOGW(TAG, "Error enviando resultado cámara por mesh: %s",
+                                 esp_err_to_name(err));
+                    }
+                }
+            }
+        } else {
+            publish_camera_status(item.command, "capture_inference_done_no_result");
+        }
+    }
+}
+
+/*
  * sensor_relay_task:
  * Inicializa sensor solo si la configuración dice que existe BME280.
  */
@@ -1144,9 +1446,15 @@ static void rx_task(void *arg)
                 }
 
                 if (strcmp((char *)data.data, "RELAY_ON") == 0 ||
-                    strcmp((char *)data.data, "RELAY_OFF") == 0) {
+                    strcmp((char *)data.data, "RELAY_OFF") == 0 ||
+                    is_camera_command((char *)data.data)) {
                     ESP_LOGI(TAG, "Root recibió comando de control desde mesh, no se publica como dato: %s",
                              (char *)data.data);
+                    continue;
+                }
+
+                if (is_camera_payload((char *)data.data)) {
+                    publish_camera_mesh_payload_to_mqtt(&from, (char *)data.data);
                     continue;
                 }
 
@@ -1424,9 +1732,15 @@ void app_main(void)
 
     log_memory_status("Inicio app_main");
 
-    test_barcos_model_load();
+    /*
+     * La cámara/IA ya no se ejecuta al arrancar.
+     * Ahora se ejecuta bajo demanda cuando llegue por MQTT/mesh:
+     *   CAMERA_CAPTURE
+     *   BOAT_PRESENCE
+     */
+    ESP_LOGI(TAG, "Cámara/IA en modo bajo demanda por comando MQTT/mesh");
 
-    log_memory_status("Despues de test_barcos_model_load");
+    log_memory_status("Despues de configurar modo camara bajo demanda");
 
     uint8_t mac[6];
     esp_read_mac(mac, ESP_MAC_WIFI_STA);

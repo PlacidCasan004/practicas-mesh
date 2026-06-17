@@ -25,9 +25,62 @@ static const char *TAG_MODEL = "BARCOS_MODEL";
 #define TENSOR_ARENA_SIZE (4 * 1024 * 1024)
 
 /*
+ * Resultado de la última inferencia.
+ * practicas.c puede leerlo con barcos_model_get_last_detection()
+ * para publicarlo por MQTT.
+ */
+extern "C" {
+
+typedef struct {
+    bool ok;
+    bool detected;
+    char class_name[24];
+    float score;
+} barcos_detection_result_t;
+
+}
+
+static barcos_detection_result_t g_last_detection = {
+    .ok = false,
+    .detected = false,
+    .class_name = "None",
+    .score = 0.0f
+};
+
+static void reset_last_detection(void)
+{
+    g_last_detection.ok = false;
+    g_last_detection.detected = false;
+    g_last_detection.score = 0.0f;
+    snprintf(g_last_detection.class_name,
+             sizeof(g_last_detection.class_name),
+             "None");
+}
+
+static void set_last_detection(bool detected, const char *class_name, float score)
+{
+    g_last_detection.ok = true;
+    g_last_detection.detected = detected;
+    g_last_detection.score = score;
+
+    snprintf(g_last_detection.class_name,
+             sizeof(g_last_detection.class_name),
+             "%s",
+             class_name != nullptr ? class_name : "None");
+}
+
+extern "C" bool barcos_model_get_last_detection(barcos_detection_result_t *out)
+{
+    if (out == nullptr) {
+        return false;
+    }
+
+    *out = g_last_detection;
+    return g_last_detection.ok;
+}
+
+/*
  * Pines cámara GOOUUU ESP32-S3-CAM
- *
- * Sustituye a los pines antiguos de la XIAO ESP32-S3 Sense.
  *
  * Mapeo cámara:
  * Y2  -> GPIO11
@@ -68,6 +121,10 @@ static const char *TAG_MODEL = "BARCOS_MODEL";
 #define PCLK_GPIO_NUM     13
 
 static uint8_t *tensor_arena = nullptr;
+static tflite::MicroInterpreter *g_interpreter = nullptr;
+static bool g_resolver_ready = false;
+static bool g_tensors_allocated = false;
+static tflite::MicroMutableOpResolver<30> g_resolver;
 
 static const char *tensor_type_to_str(TfLiteType type)
 {
@@ -101,6 +158,10 @@ static void print_tensor_info(const char *name, const TfLiteTensor *tensor)
             tensor->dims->data[i],
             (i == tensor->dims->size - 1) ? "" : ", "
         );
+
+        if (offset >= (int)sizeof(dims_str)) {
+            break;
+        }
     }
 
     snprintf(dims_str + offset, sizeof(dims_str) - offset, "]");
@@ -113,6 +174,86 @@ static void print_tensor_info(const char *name, const TfLiteTensor *tensor)
              dims_str,
              tensor->params.scale,
              (long)tensor->params.zero_point);
+}
+
+static bool tflite_init_once(const tflite::Model *model)
+{
+    if (model == nullptr) {
+        ESP_LOGE(TAG_MODEL, "Modelo TFLite NULL");
+        return false;
+    }
+
+    if (tensor_arena == nullptr) {
+        tensor_arena = (uint8_t *)heap_caps_malloc(
+            TENSOR_ARENA_SIZE,
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
+        );
+
+        if (tensor_arena == nullptr) {
+            ESP_LOGE(TAG_MODEL, "No se pudo reservar tensor_arena en PSRAM (%d bytes)",
+                     TENSOR_ARENA_SIZE);
+            return false;
+        }
+
+        ESP_LOGI(TAG_MODEL, "Tensor arena reservado en PSRAM: %d bytes", TENSOR_ARENA_SIZE);
+    } else {
+        ESP_LOGI(TAG_MODEL, "Tensor arena ya estaba reservado en PSRAM");
+    }
+
+    if (!g_resolver_ready) {
+        g_resolver.AddConv2D();
+        g_resolver.AddDepthwiseConv2D();
+        g_resolver.AddFullyConnected();
+        g_resolver.AddReshape();
+        g_resolver.AddTranspose();
+        g_resolver.AddConcatenation();
+        g_resolver.AddAdd();
+        g_resolver.AddSub();
+        g_resolver.AddMul();
+        g_resolver.AddLogistic();
+        g_resolver.AddSoftmax();
+        g_resolver.AddQuantize();
+        g_resolver.AddDequantize();
+        g_resolver.AddMaxPool2D();
+        g_resolver.AddPad();
+        g_resolver.AddStridedSlice();
+        g_resolver.AddResizeNearestNeighbor();
+        g_resolver.AddMean();
+        g_resolver.AddSplit();
+        g_resolver.AddSplitV();
+
+        g_resolver_ready = true;
+        ESP_LOGI(TAG_MODEL, "Resolver TFLite inicializado");
+    }
+
+    if (g_interpreter == nullptr) {
+        static tflite::MicroInterpreter interpreter(
+            model,
+            g_resolver,
+            tensor_arena,
+            TENSOR_ARENA_SIZE
+        );
+
+        g_interpreter = &interpreter;
+        ESP_LOGI(TAG_MODEL, "Interpreter TFLite creado");
+    }
+
+    if (!g_tensors_allocated) {
+        TfLiteStatus allocate_status = g_interpreter->AllocateTensors();
+
+        if (allocate_status != kTfLiteOk) {
+            ESP_LOGE(TAG_MODEL, "AllocateTensors() fallo");
+            ESP_LOGE(TAG_MODEL, "Puede faltar una operacion en el resolver o memoria");
+            return false;
+        }
+
+        g_tensors_allocated = true;
+        ESP_LOGI(TAG_MODEL, "AllocateTensors() correcto");
+    } else {
+        ESP_LOGI(TAG_MODEL, "Tensores ya estaban asignados");
+    }
+
+    return true;
 }
 
 static esp_err_t camera_init_once(void)
@@ -149,14 +290,13 @@ static esp_err_t camera_init_once(void)
     config.xclk_freq_hz = 20000000;
 
     /*
-     * Importante:
-     * Mantenemos RGB565 porque tu código convierte de RGB565 a RGB888
-     * para meter la imagen al modelo.
+     * Mantenemos RGB565 porque el código convierte de RGB565 a RGB888
+     * antes de meter la imagen al modelo.
      */
     config.pixel_format = PIXFORMAT_RGB565;
 
     /*
-     * Tu modelo espera 160x160.
+     * El modelo espera 160x160.
      * La cámara captura 160x120 y luego se hace letterbox a 160x160.
      */
     config.frame_size = FRAMESIZE_QQVGA;   // 160x120
@@ -165,10 +305,11 @@ static esp_err_t camera_init_once(void)
     config.fb_count = 1;
 
     /*
-     * Para 160x120 RGB565 cabe en DRAM.
-     * Dejamos la imagen en DRAM y reservamos la PSRAM para TensorFlow Lite.
+     * Importante:
+     * Con mesh + MQTT + TFLite funcionando, la RAM interna queda más justa.
+     * Por eso el frame buffer de 38400 bytes se reserva en PSRAM.
      */
-    config.fb_location = CAMERA_FB_IN_DRAM;
+    config.fb_location = CAMERA_FB_IN_PSRAM;
 
     config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
 
@@ -398,6 +539,12 @@ static void print_best_detection(TfLiteTensor *output)
         "Tug"
     };
 
+    if (output == nullptr || output->dims == nullptr || output->dims->size < 3) {
+        ESP_LOGE(TAG_MODEL, "Output inválido");
+        reset_last_detection();
+        return;
+    }
+
     int channels = output->dims->data[1];  // 10
     int preds = output->dims->data[2];     // 525
 
@@ -412,6 +559,11 @@ static void print_best_detection(TfLiteTensor *output)
     for (int p = 0; p < preds; p++) {
         for (int c = 0; c < 6; c++) {
             int channel = 4 + c;
+
+            if (channel >= channels) {
+                continue;
+            }
+
             int index = channel * preds + p;
 
             float score = dequantize_output_value(out[index], output);
@@ -426,6 +578,7 @@ static void print_best_detection(TfLiteTensor *output)
 
     if (best_class < 0 || best_class >= 6) {
         ESP_LOGE(TAG_MODEL, "Clase inválida en salida");
+        reset_last_detection();
         return;
     }
 
@@ -436,16 +589,25 @@ static void print_best_detection(TfLiteTensor *output)
              best_pred);
 
     if (best_score > 0.20f) {
+        set_last_detection(true, classes[best_class], best_score);
+
         ESP_LOGI(TAG_MODEL, "POSIBLE BARCO DETECTADO: %s score=%.3f",
                  classes[best_class],
                  best_score);
     } else {
-        ESP_LOGW(TAG_MODEL, "No hay detección clara. Mejor score=%.3f", best_score);
+        set_last_detection(false, classes[best_class], best_score);
+
+        ESP_LOGW(TAG_MODEL,
+                 "No hay detección clara. Mejor candidato=%s score=%.3f",
+                 classes[best_class],
+                 best_score);
     }
 }
 
 extern "C" void test_barcos_model_load(void)
 {
+    reset_last_detection();
+
     ESP_LOGI(TAG_MODEL, "Memoria libre interna: %u bytes",
              (unsigned int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
 
@@ -463,58 +625,11 @@ extern "C" void test_barcos_model_load(void)
     ESP_LOGI(TAG_MODEL, "Tamaño modelo: %u bytes", barcos_model_tflite_len);
     ESP_LOGI(TAG_MODEL, "Schema version modelo: %d", (int)model->version());
 
-    tensor_arena = (uint8_t *)heap_caps_malloc(
-        TENSOR_ARENA_SIZE,
-        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
-    );
-
-    if (tensor_arena == nullptr) {
-        ESP_LOGE(TAG_MODEL, "No se pudo reservar tensor_arena en PSRAM (%d bytes)",
-                 TENSOR_ARENA_SIZE);
+    if (!tflite_init_once(model)) {
         return;
     }
 
-    ESP_LOGI(TAG_MODEL, "Tensor arena reservado en PSRAM: %d bytes", TENSOR_ARENA_SIZE);
-
-    static tflite::MicroMutableOpResolver<30> resolver;
-
-    resolver.AddConv2D();
-    resolver.AddDepthwiseConv2D();
-    resolver.AddFullyConnected();
-    resolver.AddReshape();
-    resolver.AddTranspose();
-    resolver.AddConcatenation();
-    resolver.AddAdd();
-    resolver.AddSub();
-    resolver.AddMul();
-    resolver.AddLogistic();
-    resolver.AddSoftmax();
-    resolver.AddQuantize();
-    resolver.AddDequantize();
-    resolver.AddMaxPool2D();
-    resolver.AddPad();
-    resolver.AddStridedSlice();
-    resolver.AddResizeNearestNeighbor();
-    resolver.AddMean();
-    resolver.AddSplit();
-    resolver.AddSplitV();
-
-    static tflite::MicroInterpreter interpreter(
-        model,
-        resolver,
-        tensor_arena,
-        TENSOR_ARENA_SIZE
-    );
-
-    TfLiteStatus allocate_status = interpreter.AllocateTensors();
-
-    if (allocate_status != kTfLiteOk) {
-        ESP_LOGE(TAG_MODEL, "AllocateTensors() fallo");
-        ESP_LOGE(TAG_MODEL, "Puede faltar una operacion en el resolver o memoria");
-        return;
-    }
-
-    ESP_LOGI(TAG_MODEL, "AllocateTensors() correcto");
+    tflite::MicroInterpreter &interpreter = *g_interpreter;
 
     ESP_LOGI(TAG_MODEL, "Numero de inputs: %d", (int)interpreter.inputs_size());
     for (size_t i = 0; i < interpreter.inputs_size(); i++) {

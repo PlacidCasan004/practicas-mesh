@@ -17,6 +17,8 @@
 #include "esp_wifi.h"
 #include "esp_netif.h"
 #include "esp_mesh.h"
+#include "esp_heap_caps.h"
+#include "esp_timer.h"
 #include "mqtt_client.h"
 #include "driver/gpio.h"
 #include "driver/i2c.h"
@@ -34,7 +36,7 @@
 #define ROUTER_PASS            "tequieromuchocartucho"
 #define ROUTER_CHANNEL         2
 
-#define MQTT_BROKER_URI        "mqtt://192.168.1.101"
+#define MQTT_BROKER_URI        "mqtt://192.168.1.222"
 
 /* Topics MQTT */
 #define MQTT_DATA_BASE_TOPIC       "mesh/data"
@@ -52,6 +54,25 @@
 #define MQTT_MSG_MAX_LEN       512
 #define MQTT_TOPIC_MAX_LEN     128
 
+/* Stacks de tareas.
+ * Antes eran bastante altos. Con cámara + TensorFlow Lite + mesh + MQTT,
+ * conviene ahorrar memoria interna para que no fallen las xTaskCreate().
+ */
+#define RX_TASK_STACK              8192
+#define TX_TASK_STACK              4096
+#define MQTT_TASK_STACK            4096
+#define SENSOR_RELAY_TASK_STACK    4096
+#define CONFIG_REQUEST_TASK_STACK  3072
+#define CAMERA_TASK_STACK          8192
+#define TASK_PRIORITY              5
+
+/* Comandos de cámara */
+#define CAMERA_CMD_QUEUE_LEN       4
+#define CAMERA_CMD_MAX_LEN         64
+#define CAMERA_CMD_CAPTURE         "CAMERA_CAPTURE"
+#define CAMERA_CMD_BOAT_PRESENCE   "BOAT_PRESENCE"
+#define CAMERA_RESULT_SUFFIX       "detection"
+
 /* BME280 */
 #define I2C_MASTER_SCL_IO      22
 #define I2C_MASTER_SDA_IO      21
@@ -60,7 +81,7 @@
 #define BME280_I2C_ADDRESS     0x76
 
 /* Relé */
-#define RELAY_PIN              GPIO_NUM_23
+#define RELAY_PIN              GPIO_NUM_1
 #define RELAY_ACTIVE_LOW       1
 
 typedef struct {
@@ -80,7 +101,13 @@ typedef struct {
     char payload[MQTT_MSG_MAX_LEN];
 } sensor_snapshot_t;
 
+typedef struct {
+    char command[CAMERA_CMD_MAX_LEN];
+    int64_t timestamp_us;
+} camera_command_item_t;
+
 static QueueHandle_t mqtt_queue = NULL;
+static QueueHandle_t camera_cmd_queue = NULL;
 static SemaphoreHandle_t sensor_mutex = NULL;
 static SemaphoreHandle_t relay_mutex = NULL;
 
@@ -115,14 +142,40 @@ static char g_tipo_nodo[32] = {0};
 static char g_topic_pub_cfg[MQTT_TOPIC_MAX_LEN] = {0};
 static char g_topic_sub_cfg[MQTT_TOPIC_MAX_LEN] = {0};
 
+/* Handles de tareas.
+ * Sirven para no crear tareas duplicadas cuando la mesh se desconecta y reconecta.
+ */
+static TaskHandle_t rx_task_handle = NULL;
+static TaskHandle_t tx_task_handle = NULL;
+static TaskHandle_t mqtt_task_handle = NULL;
+static TaskHandle_t sensor_relay_task_handle = NULL;
+static TaskHandle_t config_request_task_handle = NULL;
+static TaskHandle_t camera_task_handle = NULL;
+
 /* Prototipos */
+typedef struct {
+    bool ok;
+    bool detected;
+    char class_name[24];
+    float score;
+} barcos_detection_result_t;
+
+void test_barcos_model_load(void);
+bool barcos_model_get_last_detection(barcos_detection_result_t *out);
+
 static void rx_task(void *arg);
 static void tx_task(void *arg);
 static void mqtt_task(void *arg);
 static void sensor_relay_task(void *arg);
 static void config_request_task(void *arg);
+static void camera_task(void *arg);
 
 static void start_mesh_tasks_once(void);
+static bool create_task_if_needed(TaskHandle_t *handle,
+                                  TaskFunction_t function,
+                                  const char *name,
+                                  uint32_t stack_depth);
+static void log_memory_status(const char *label);
 static void mqtt_app_start(void);
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
                                int32_t event_id, void *event_data);
@@ -133,6 +186,9 @@ static void mesh_init(void);
 static void relay_init(void);
 static void relay_set(bool on);
 static void process_mesh_command(const char *cmd);
+static bool is_camera_command(const char *cmd);
+static void enqueue_camera_command(const char *cmd);
+static void publish_camera_status(const char *cmd, const char *status);
 
 static void i2c_master_init_once(void);
 static esp_err_t sensor_init_once(void);
@@ -152,6 +208,140 @@ static bool split_bme280_payload_to_topics(const mesh_addr_t *from, const char *
 
 static void reset_node_capabilities(void);
 static bool apply_node_config(const char *json_cfg);
+
+/*
+ * log_memory_status:
+ * Imprime memoria libre para diagnosticar fallos de creación de tareas.
+ */
+static void log_memory_status(const char *label)
+{
+    ESP_LOGI(TAG, "%s | heap interno libre=%u bytes | PSRAM libre=%u bytes",
+             label,
+             (unsigned int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned int)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+}
+
+/*
+ * create_task_if_needed:
+ * Crea una tarea solo si su handle está vacío.
+ */
+static bool create_task_if_needed(TaskHandle_t *handle,
+                                  TaskFunction_t function,
+                                  const char *name,
+                                  uint32_t stack_depth)
+{
+    if (*handle != NULL) {
+        ESP_LOGW(TAG, "%s ya estaba creada, no se crea otra vez", name);
+        return true;
+    }
+
+    BaseType_t ok = xTaskCreate(
+        function,
+        name,
+        stack_depth,
+        NULL,
+        TASK_PRIORITY,
+        handle
+    );
+
+    if (ok != pdPASS) {
+        ESP_LOGE(TAG, "No se pudo crear %s", name);
+        log_memory_status("Memoria al fallar xTaskCreate");
+        *handle = NULL;
+        return false;
+    }
+
+    ESP_LOGI(TAG, "%s creada correctamente con stack=%lu", name, (unsigned long)stack_depth);
+    return true;
+}
+
+/*
+ * is_camera_command:
+ * Indica si el payload recibido es un comando para disparar la cámara.
+ */
+static bool is_camera_command(const char *cmd)
+{
+    if (cmd == NULL) {
+        return false;
+    }
+
+    return (strcmp(cmd, CAMERA_CMD_CAPTURE) == 0 ||
+            strcmp(cmd, CAMERA_CMD_BOAT_PRESENCE) == 0);
+}
+
+/*
+ * enqueue_camera_command:
+ * Mete un comando de cámara en una cola para que lo procese camera_task.
+ * Así no se bloquea el callback MQTT ni la recepción mesh ejecutando la IA directamente.
+ */
+static void enqueue_camera_command(const char *cmd)
+{
+    if (camera_cmd_queue == NULL) {
+        ESP_LOGW(TAG, "Cola de cámara no inicializada");
+        return;
+    }
+
+    camera_command_item_t item = {0};
+
+    snprintf(item.command, sizeof(item.command), "%s", cmd);
+    item.timestamp_us = esp_timer_get_time();
+
+    if (xQueueSend(camera_cmd_queue, &item, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "Cola de cámara llena, comando descartado: %s", cmd);
+        publish_camera_status(cmd, "discarded_camera_queue_full");
+        return;
+    }
+
+    ESP_LOGI(TAG, "Comando de cámara encolado: %s", cmd);
+}
+
+/*
+ * publish_camera_status:
+ * Publica un estado sencillo del nodo cámara.
+ * La clase/score los sigue imprimiendo test_barcos_model_load() por consola.
+ */
+static void publish_camera_status(const char *cmd, const char *status)
+{
+    char payload[MQTT_MSG_MAX_LEN];
+    char topic[MQTT_TOPIC_MAX_LEN];
+
+    snprintf(payload, sizeof(payload),
+             "{\"node\":\"%s\",\"type\":\"camera\",\"command\":\"%s\",\"status\":\"%s\",\"layer\":%d}",
+             g_mac_no_colons,
+             cmd != NULL ? cmd : "UNKNOWN",
+             status != NULL ? status : "unknown",
+             esp_mesh_get_layer());
+
+    if (esp_mesh_is_root()) {
+             snprintf(topic, sizeof(topic), "%s/%s/%s",
+             MQTT_DATA_BASE_TOPIC,
+             g_mac_no_colons,
+             CAMERA_RESULT_SUFFIX);
+
+        enqueue_mqtt_message(topic, payload);
+        return;
+    }
+
+    if (!is_mesh_connected) {
+        ESP_LOGW(TAG, "No se puede publicar estado cámara: nodo no conectado a mesh");
+        return;
+    }
+
+    mesh_data_t data;
+
+    data.data = (uint8_t *)payload;
+    data.size = strlen(payload) + 1;
+    data.proto = MESH_PROTO_BIN;
+    data.tos = MESH_TOS_P2P;
+
+    esp_err_t err = esp_mesh_send(NULL, &data, 0, NULL, 0);
+
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "Estado de cámara enviado por mesh: %s", payload);
+    } else {
+        ESP_LOGW(TAG, "Error enviando estado de cámara por mesh: %s", esp_err_to_name(err));
+    }
+}
 
 /*
  * relay_init:
@@ -252,6 +442,16 @@ static esp_err_t sensor_init_once(void)
  */
 static void process_mesh_command(const char *cmd)
 {
+    if (cmd == NULL) {
+        return;
+    }
+
+    if (is_camera_command(cmd)) {
+        ESP_LOGI(TAG, "Comando de cámara recibido por MQTT/mesh: %s", cmd);
+        enqueue_camera_command(cmd);
+        return;
+    }
+
     if (relay_mutex != NULL &&
         xSemaphoreTake(relay_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
 
@@ -659,52 +859,93 @@ static void forward_mqtt_command_to_mesh_topic(const char *topic, const char *pa
 /*
  * start_mesh_tasks_once:
  * Arranca las tareas solo una vez.
+ * Si la mesh se reconecta, no duplica tareas.
+ * Si alguna falla por memoria, se indica cuál falla.
  */
 static void start_mesh_tasks_once(void)
 {
-    static bool started = false;
+    bool all_ok = true;
 
-    if (started) {
-        return;
-    }
+    log_memory_status("Antes de crear recursos/tareas mesh");
 
     if (mqtt_queue == NULL) {
         mqtt_queue = xQueueCreate(MQTT_QUEUE_LEN, sizeof(mqtt_publish_item_t));
         if (mqtt_queue == NULL) {
             ESP_LOGE(TAG, "No se pudo crear la cola MQTT");
+            log_memory_status("Memoria al fallar cola MQTT");
             return;
         }
+        ESP_LOGI(TAG, "Cola MQTT creada");
+    }
+
+    if (camera_cmd_queue == NULL) {
+        camera_cmd_queue = xQueueCreate(CAMERA_CMD_QUEUE_LEN, sizeof(camera_command_item_t));
+        if (camera_cmd_queue == NULL) {
+            ESP_LOGE(TAG, "No se pudo crear la cola de cámara");
+            log_memory_status("Memoria al fallar cola cámara");
+            return;
+        }
+        ESP_LOGI(TAG, "Cola de cámara creada");
     }
 
     if (sensor_mutex == NULL) {
         sensor_mutex = xSemaphoreCreateMutex();
         if (sensor_mutex == NULL) {
             ESP_LOGE(TAG, "No se pudo crear el mutex del sensor");
+            log_memory_status("Memoria al fallar mutex sensor");
             return;
         }
+        ESP_LOGI(TAG, "Mutex sensor creado");
     }
 
     if (relay_mutex == NULL) {
         relay_mutex = xSemaphoreCreateMutex();
         if (relay_mutex == NULL) {
             ESP_LOGE(TAG, "No se pudo crear el mutex del rele");
+            log_memory_status("Memoria al fallar mutex rele");
             return;
         }
+        ESP_LOGI(TAG, "Mutex rele creado");
     }
 
-    BaseType_t ok1 = xTaskCreate(rx_task, "rx_task", 12288, NULL, 5, NULL);
-    BaseType_t ok2 = xTaskCreate(tx_task, "tx_task", 8192, NULL, 5, NULL);
-    BaseType_t ok3 = xTaskCreate(mqtt_task, "mqtt_task", 8192, NULL, 5, NULL);
-    BaseType_t ok4 = xTaskCreate(sensor_relay_task, "sensor_relay_task", 8192, NULL, 5, NULL);
-    BaseType_t ok5 = xTaskCreate(config_request_task, "config_request_task", 4096, NULL, 5, NULL);
+    all_ok &= create_task_if_needed(&rx_task_handle,
+                                    rx_task,
+                                    "rx_task",
+                                    RX_TASK_STACK);
 
-    if (ok1 != pdPASS || ok2 != pdPASS || ok3 != pdPASS || ok4 != pdPASS || ok5 != pdPASS) {
+    all_ok &= create_task_if_needed(&tx_task_handle,
+                                    tx_task,
+                                    "tx_task",
+                                    TX_TASK_STACK);
+
+    all_ok &= create_task_if_needed(&mqtt_task_handle,
+                                    mqtt_task,
+                                    "mqtt_task",
+                                    MQTT_TASK_STACK);
+
+    all_ok &= create_task_if_needed(&sensor_relay_task_handle,
+                                    sensor_relay_task,
+                                    "sensor_relay_task",
+                                    SENSOR_RELAY_TASK_STACK);
+
+    all_ok &= create_task_if_needed(&config_request_task_handle,
+                                    config_request_task,
+                                    "config_request_task",
+                                    CONFIG_REQUEST_TASK_STACK);
+
+    all_ok &= create_task_if_needed(&camera_task_handle,
+                                    camera_task,
+                                    "camera_task",
+                                    CAMERA_TASK_STACK);
+
+    log_memory_status("Despues de crear recursos/tareas mesh");
+
+    if (!all_ok) {
         ESP_LOGE(TAG, "No se pudieron crear todas las tareas");
         return;
     }
 
-    started = true;
-    ESP_LOGI(TAG, "Tareas creadas correctamente");
+    ESP_LOGI(TAG, "Tareas mesh listas");
 }
 
 /*
@@ -731,11 +972,9 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
                 int cfg_id = esp_mqtt_client_subscribe(mqtt_client, MQTT_CONFIG_BASE_TOPIC "/#", 1);
                 ESP_LOGI(TAG, "Suscrito a topic %s/#, msg_id=%d", MQTT_CONFIG_BASE_TOPIC, cfg_id);
 
-                {
-                    uint8_t mac[6];
-                    esp_read_mac(mac, ESP_MAC_WIFI_STA);
-                    request_config_via_mqtt_for_mac(mac);
-                }
+                uint8_t mac[6];
+                esp_read_mac(mac, ESP_MAC_WIFI_STA);
+                request_config_via_mqtt_for_mac(mac);
             }
             break;
 
@@ -879,6 +1118,7 @@ static void mesh_event_handler(void *arg, esp_event_base_t event_base,
 
             case MESH_EVENT_PARENT_DISCONNECTED:
                 is_mesh_connected = false;
+                mqtt_connected = false;
                 ESP_LOGW(TAG, "Desconectado de mesh");
                 break;
 
@@ -914,6 +1154,83 @@ static void mesh_event_handler(void *arg, esp_event_base_t event_base,
 }
 
 /*
+ * camera_task:
+ * Espera comandos de cámara y ejecuta la captura/inferencia bajo demanda.
+ */
+static void camera_task(void *arg)
+{
+    (void)arg;
+
+    camera_command_item_t item;
+
+    ESP_LOGI(TAG, "camera_task arrancada");
+
+    while (1) {
+        if (camera_cmd_queue == NULL) {
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
+        }
+
+        if (xQueueReceive(camera_cmd_queue, &item, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+
+        ESP_LOGI(TAG, "camera_task procesa comando: %s", item.command);
+
+        if (!g_config_received || !g_has_config) {
+            ESP_LOGW(TAG, "Comando cámara ignorado: aún no hay configuración del nodo");
+            publish_camera_status(item.command, "ignored_no_config");
+            continue;
+        }
+
+        if (strcmp(g_tipo_nodo, "camara") != 0 &&
+            strcmp(g_tipo_nodo, "camera") != 0) {
+            ESP_LOGW(TAG, "Comando cámara ignorado: este nodo no es tipo camara, tipo_nodo=%s",
+                     g_tipo_nodo);
+            publish_camera_status(item.command, "ignored_not_camera_node");
+            continue;
+        }
+
+        publish_camera_status(item.command, "capture_started");
+        log_memory_status("Antes de ejecutar cámara/IA por comando");
+
+        /*
+         * Esta función ya inicializa cámara/modelo, captura y ejecuta inferencia.
+         * Para versión final conviene separar inicialización y captura para no
+         * reinicializar todo cada vez.
+         */
+        test_barcos_model_load();
+
+	barcos_detection_result_t det = {0};
+	bool has_result = barcos_model_get_last_detection(&det);
+	
+	log_memory_status("Despues de ejecutar cámara/IA por comando");
+	
+	if (has_result) {
+	    char topic[MQTT_TOPIC_MAX_LEN];
+	    char payload[MQTT_MSG_MAX_LEN];
+
+	    snprintf(topic, sizeof(topic), "%s/%s/detection",
+        	     MQTT_DATA_BASE_TOPIC,
+        	     g_mac_no_colons);
+
+	    snprintf(payload, sizeof(payload),
+            	"{\"node\":\"%s\",\"type\":\"camera\",\"command\":\"%s\",\"status\":					\"capture_inference_done\",\"detected\":%s,\"class\":\"%s\",\"score\":%.3f,\"layer\":%d}",
+             g_mac_no_colons,
+             item.command,
+             det.detected ? "true" : "false",
+             det.class_name,
+             det.score,
+             esp_mesh_get_layer());
+
+    	    enqueue_mqtt_message(topic, payload);
+	} else {
+    	    publish_camera_status(item.command, "capture_inference_done_no_result");
+	}
+    }
+}
+
+/*
  * sensor_relay_task:
  * Inicializa sensor solo si la configuración dice que existe BME280.
  */
@@ -924,12 +1241,12 @@ static void sensor_relay_task(void *arg)
     relay_init();
 
     while (!g_config_received || !g_has_config) {
-        ESP_LOGI(TAG, "Esperando configuración del nodo...");
+        ESP_LOGI(TAG, "Esperando configuración del nodo antes de iniciar sensor...");
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 
     if (!g_has_bme280) {
-        ESP_LOGI(TAG, "Este nodo no tiene BME280 según la configuración. No se inicia tarea de sensor.");
+        ESP_LOGI(TAG, "Este nodo no tiene BME280 según la configuración. sensor_relay_task termina.");
         vTaskDelete(NULL);
         return;
     }
@@ -1045,7 +1362,8 @@ static void rx_task(void *arg)
                 }
 
                 if (strcmp((char *)data.data, "RELAY_ON") == 0 ||
-                    strcmp((char *)data.data, "RELAY_OFF") == 0) {
+                    strcmp((char *)data.data, "RELAY_OFF") == 0 ||
+                    is_camera_command((char *)data.data)) {
                     ESP_LOGI(TAG, "Root recibió comando de control desde mesh, no se publica como dato: %s",
                              (char *)data.data);
                     continue;
@@ -1150,6 +1468,7 @@ static void tx_task(void *arg)
 /*
  * mqtt_task:
  * Espera mensajes en la cola y los publica en el broker MQTT.
+ * Cambio importante: si MQTT no está conectado, NO consume la cola.
  */
 static void mqtt_task(void *arg)
 {
@@ -1158,27 +1477,22 @@ static void mqtt_task(void *arg)
     mqtt_publish_item_t item;
 
     while (1) {
+        if (!esp_mesh_is_root()) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
         if (mqtt_queue == NULL) {
             vTaskDelay(pdMS_TO_TICKS(500));
             continue;
         }
 
-        if (xQueueReceive(mqtt_queue, &item, portMAX_DELAY) == pdTRUE) {
-            if (!esp_mesh_is_root()) {
-                ESP_LOGW(TAG, "mqtt_task activa en un nodo no-root, mensaje ignorado");
-                continue;
-            }
+        if (mqtt_client == NULL || !mqtt_connected) {
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
+        }
 
-            if (mqtt_client == NULL) {
-                ESP_LOGW(TAG, "Cliente MQTT no inicializado");
-                continue;
-            }
-
-            if (!mqtt_connected) {
-                ESP_LOGW(TAG, "MQTT no conectado, no se publica");
-                continue;
-            }
-
+        if (xQueueReceive(mqtt_queue, &item, pdMS_TO_TICKS(1000)) == pdTRUE) {
             int msg_id = esp_mqtt_client_publish(
                 mqtt_client,
                 item.topic,
@@ -1192,7 +1506,9 @@ static void mqtt_task(void *arg)
                 ESP_LOGI(TAG, "Publicado en MQTT topic %s, msg_id=%d, msg=%s",
                          item.topic, msg_id, item.payload);
             } else {
-                ESP_LOGW(TAG, "No se pudo publicar en MQTT");
+                ESP_LOGW(TAG, "No se pudo publicar en MQTT, reintentando luego");
+                (void)xQueueSendToFront(mqtt_queue, &item, 0);
+                vTaskDelay(pdMS_TO_TICKS(1000));
             }
         }
     }
@@ -1201,6 +1517,7 @@ static void mqtt_task(void *arg)
 /*
  * config_request_task:
  * Reintenta pedir la configuración hasta recibirla.
+ * Cambio importante: el root espera a que MQTT esté conectado antes de pedir config.
  */
 static void config_request_task(void *arg)
 {
@@ -1209,12 +1526,23 @@ static void config_request_task(void *arg)
     ESP_LOGI(TAG, "config_request_task arrancada");
 
     while (1) {
-        if (!g_config_received) {
-            if (esp_mesh_is_root()) {
+        if (g_config_received) {
+            vTaskDelay(pdMS_TO_TICKS(CONFIG_RETRY_MS));
+            continue;
+        }
+
+        if (esp_mesh_is_root()) {
+            if (!mqtt_connected) {
+                ESP_LOGW(TAG, "Root espera a MQTT antes de pedir config");
+            } else {
                 uint8_t mac[6];
                 esp_read_mac(mac, ESP_MAC_WIFI_STA);
                 ESP_LOGI(TAG, "Root va a pedir su config");
                 request_config_via_mqtt_for_mac(mac);
+            }
+        } else {
+            if (!is_mesh_connected) {
+                ESP_LOGW(TAG, "Nodo no-root espera conexión mesh antes de pedir config");
             } else {
                 ESP_LOGI(TAG, "Nodo no root va a pedir config al root");
                 request_config_from_root_over_mesh();
@@ -1312,6 +1640,18 @@ void app_main(void)
         err = nvs_flash_init();
     }
     ESP_ERROR_CHECK(err);
+
+    log_memory_status("Inicio app_main");
+
+    /*
+     * La cámara/IA ya no se ejecuta al arrancar.
+     * Ahora se ejecuta bajo demanda cuando llegue por MQTT/mesh:
+     *   CAMERA_CAPTURE
+     *   BOAT_PRESENCE
+     */
+    ESP_LOGI(TAG, "Cámara/IA en modo bajo demanda por comando MQTT/mesh");
+
+    log_memory_status("Despues de configurar modo camara bajo demanda");
 
     uint8_t mac[6];
     esp_read_mac(mac, ESP_MAC_WIFI_STA);
